@@ -1,0 +1,24 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs / caches
+*.log
+.cache/
+node_modules/
+
+# Local secrets / env
+.env
+.env.*
+*.pem
+*.key
+
+# Everything ES download leftovers (if ever placed in-repo by mistake)
+es.exe
+es.zip
