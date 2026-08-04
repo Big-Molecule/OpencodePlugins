@@ -1,13 +1,3 @@
-/**
- * OpenCode port of niu-image-gen (Codex / AiMaMi lineage).
- *
- * Upstream: borawong/AiMaMi (Apache-2.0), commit 297c7af
- * Codex marketplace port: Big-Molecule/CodexPlugins
- * OpenCode adaptation: config under ~/.config/opencode, tool-based API, minimal decoration.
- *
- * See plugins/niu-image-gen.NOTICE.md for attribution.
- */
-
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import {
   chmodSync,
@@ -19,8 +9,11 @@ import {
 import { basename, dirname, join } from "node:path"
 import { homedir } from "node:os"
 
-const CONFIG_PATH = join(homedir(), ".config", "opencode", "niu-image-gen.json")
-const LEGACY_CONFIG_PATH = join(homedir(), ".codex", "niu-image-gen-config.json")
+const CONFIG_PATH = join(homedir(), ".config", "opencode", "image-gen.json")
+const LEGACY_CONFIG_PATHS = [
+  join(homedir(), ".codex", "niu-image-gen-config.json"),
+  join(homedir(), ".codex", "image-gen-config.json"),
+]
 
 const DEFAULT_API = Object.freeze({
   protocol: "https",
@@ -32,13 +25,13 @@ const DEFAULT_API = Object.freeze({
 })
 
 const API_ENV = Object.freeze({
-  protocol: "NIU_IMAGE_GEN_API_PROTOCOL",
-  host: "NIU_IMAGE_GEN_API_HOST",
-  port: "NIU_IMAGE_GEN_API_PORT",
-  path: "NIU_IMAGE_GEN_API_PATH",
-  modelsPath: "NIU_IMAGE_GEN_API_MODELS_PATH",
-  key: "NIU_IMAGE_GEN_API_KEY",
-  model: "NIU_IMAGE_GEN_API_MODEL",
+  protocol: "IMAGE_GEN_API_PROTOCOL",
+  host: "IMAGE_GEN_API_HOST",
+  port: "IMAGE_GEN_API_PORT",
+  path: "IMAGE_GEN_API_PATH",
+  modelsPath: "IMAGE_GEN_API_MODELS_PATH",
+  key: "IMAGE_GEN_API_KEY",
+  model: "IMAGE_GEN_API_MODEL",
 })
 
 const IMAGE_MODEL_HINT =
@@ -146,7 +139,7 @@ function previewSecret(value: string | null | undefined) {
 }
 
 function loadConfig(): StoredConfig | null {
-  for (const path of [CONFIG_PATH, LEGACY_CONFIG_PATH]) {
+  for (const path of [CONFIG_PATH, ...LEGACY_CONFIG_PATHS]) {
     if (!existsSync(path)) continue
     try {
       return JSON.parse(readFileSync(path, "utf-8")) as StoredConfig
@@ -235,7 +228,7 @@ function resolveSize(quality: string, ratio: string) {
 }
 
 function resolveOutputDir(userDir?: string) {
-  const dir = userDir?.trim() || join(homedir(), "Pictures", "niu-image-gen")
+  const dir = userDir?.trim() || join(homedir(), "Pictures", "image-gen")
   mkdirSync(dir, { recursive: true })
   return dir
 }
@@ -463,7 +456,7 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, inde
 
 function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
   const lines = [
-    "Niu Image Gen — status",
+    "Image Gen - status",
     "",
     `Config file: ${CONFIG_PATH}`,
     `Endpoint:    ${api.endpoint}`,
@@ -480,12 +473,12 @@ function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
       ? `  quality=${cfg.batchMode.quality} ratio=${cfg.batchMode.ratio} concurrency=${cfg.batchMode.concurrency}`
       : "  not configured (defaults: 2K / square / concurrency 3)",
     "",
-    "Env overrides: NIU_IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL",
+    "Env overrides: IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL",
     "",
     "Next steps:",
     api.key
-      ? "- Use niu_image_generate with a prompt, or niu_image_list_models to pick a model."
-      : "- Call niu_image_configure with action=set_key (or set_api) before generating.",
+      ? "- Use image_generate with a prompt, or image_list_models to pick a model."
+      : "- Call image_configure with action=set_key (or set_api) before generating.",
   ]
   return lines.join("\n")
 }
@@ -494,19 +487,19 @@ function requireKey(api: ResolvedApi) {
   if (!api.key) {
     return [
       "API key is not configured.",
-      `Set env ${API_ENV.key}, or call niu_image_configure with action=set_key / set_api.`,
+      `Set env ${API_ENV.key}, or call image_configure with action=set_key / set_api.`,
       `Config path: ${CONFIG_PATH}`,
     ].join("\n")
   }
   return null
 }
 
-export const NiuImageGenPlugin: Plugin = async () => {
+export const ImageGenPlugin: Plugin = async () => {
   return {
     tool: {
-      niu_image_status: tool({
+      image_status: tool({
         description:
-          "Show Niu Image Gen configuration status (endpoint, model, key presence, quick/batch defaults). Call this first when the user wants to generate or edit images with Niu Image Gen, or when checking setup. Do not use for OpenCode built-in image tools.",
+          "Show Image Gen configuration status (endpoint, model, key presence, quick/batch defaults). Call this first when the user wants to generate or edit images with Image Gen, or when checking setup. Do not use for OpenCode built-in image tools.",
         args: {},
         async execute() {
           const cfg = loadConfig()
@@ -515,9 +508,9 @@ export const NiuImageGenPlugin: Plugin = async () => {
         },
       }),
 
-      niu_image_configure: tool({
+      image_configure: tool({
         description: [
-          "Configure Niu Image Gen (local config file, no network except validation).",
+          "Configure Image Gen (local config file, no network except validation).",
           "Actions: set_key | set_api | set_model | set_quick_mode | set_batch_mode.",
           "Use when the user provides API key, endpoint, model, or default quality/ratio.",
           "Do not generate images with this tool.",
@@ -629,7 +622,7 @@ export const NiuImageGenPlugin: Plugin = async () => {
                 `Count:   ${cfg.quickMode.count}`,
                 `File:    ${CONFIG_PATH}`,
                 "",
-                "Later: niu_image_generate with only prompt uses these defaults.",
+                "Later: image_generate with only prompt uses these defaults.",
               ].join("\n")
             }
 
@@ -662,7 +655,7 @@ export const NiuImageGenPlugin: Plugin = async () => {
         },
       }),
 
-      niu_image_list_models: tool({
+      image_list_models: tool({
         description:
           "Query the configured OpenAI-compatible /models endpoint and list available models. Prefer models flagged as likely image models. Use when choosing or verifying an image model. Does not search the public web.",
         args: {},
@@ -683,7 +676,7 @@ export const NiuImageGenPlugin: Plugin = async () => {
               "All models:",
               ...result.models.map((m, i) => `  ${i + 1}. ${m.id}${m.likelyImageModel ? "  [image?]" : ""}`),
               "",
-              "To select: niu_image_configure action=set_model model=<id>",
+              "To select: image_configure action=set_model model=<id>",
             ]
             return lines.join("\n")
           } catch (err: any) {
@@ -692,11 +685,11 @@ export const NiuImageGenPlugin: Plugin = async () => {
         },
       }),
 
-      niu_image_generate: tool({
+      image_generate: tool({
         description: [
           "Generate image(s) via the configured OpenAI-compatible image API (b64_json response).",
-          "Use when the user wants to create/draw images with Niu Image Gen.",
-          "Requires API key (niu_image_status / niu_image_configure first if missing).",
+          "Use when the user wants to create/draw images with Image Gen.",
+          "Requires API key (image_status / image_configure first if missing).",
           "quality: 1K|2K|4K; ratio: square|landscape|portrait; count 1-4 variations of the same prompt.",
           "For multiple different prompts, pass prompts as a JSON array string in batch_prompts.",
         ].join(" "),
@@ -798,7 +791,7 @@ export const NiuImageGenPlugin: Plugin = async () => {
         },
       }),
 
-      niu_image_edit: tool({
+      image_edit: tool({
         description: [
           "Edit an existing image with the configured image API (sends image as data URL + prompt).",
           "Use when the user wants to modify a local image (background change, add/remove objects, style transfer).",
