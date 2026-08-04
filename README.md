@@ -77,10 +77,18 @@ Then restart OpenCode.
 **Standard flow** (do not ask the user to invent a model id)
 
 1. `image_status`
-2. If incomplete: collect **API key + host only** → `image_configure` `set_api` (**omit model**)
-3. `image_list_models` → show numbered list (prefer `[image?]`) → user picks
-4. `image_configure` `set_model` with the chosen id
+2. Collect **API key + host only** → `image_configure` `set_api` (**omit model**)
+3. Auto-verify after save:
+   - `/models` OK → connection valid; show model candidates
+   - `/models` fail → image-endpoint auth probe (missing models ≠ bad key)
+   - auth fail / host unreachable → tell user; allow **cancel setup**
+4. Pick model: from list, or manual id if provider has no catalog
 5. Optional: `set_quick_mode` → `image_generate` / `image_edit`
+
+User may exit setup anytime (退出配置 / cancel); do not continue image work until they resume.
+
+Manual re-check: `image_configure action=verify`  
+Skip network check: `skip_verify=true` on set_api/set_key.
 
 **Config (OpenCode only)**
 

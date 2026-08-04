@@ -166,8 +166,13 @@ function setupGuide(reason: string) {
     "",
     `OpenCode config only: ${CONFIG_PATH}`,
     "",
+    "User can EXIT setup at any time:",
+    "  - Say cancel / 退出配置 / 先不做了 to stop setup and pause image work.",
+    "  - Do not keep pressing for key/host after the user cancels.",
+    "  - Resume later with image_status when they want images again.",
+    "",
     "Do NOT ask the user to invent a model id first.",
-    "Flow: connection (key+host) -> list models from API -> user picks one.",
+    "Flow: connection (key+host) -> verify -> list models (or manual model) -> generate.",
     "",
     "Step 1 — save connection (model optional, omit it):",
     "  image_configure action=set_api",
@@ -176,14 +181,15 @@ function setupGuide(reason: string) {
     "    key=<api-key>",
     "    path=/v1/images/generations   (optional)",
     "    models_path=/v1/models        (optional)",
+    "  After save, connection is verified automatically (unless skip_verify=true).",
     "",
-    "Step 2 — discover models from the provider:",
-    "  image_list_models",
-    "  Show the user the numbered list, especially [image?] candidates.",
-    "  Ask them to pick a number or id from that list.",
+    "Step 2 — if verify found models:",
+    "  image_list_models (or use the list from verify output)",
+    "  Ask the user to pick a number/id (prefer [image?]).",
     "",
-    "Step 3 — save their choice:",
-    "  image_configure action=set_model model=<id-from-list>",
+    "Step 3 — if /models is unsupported but auth probe passed:",
+    "  Ask the user for a model id they know works on that site,",
+    "  then image_configure action=set_model model=<id>",
     "",
     "Step 4 — optional quick defaults, then generate:",
     "  image_configure action=set_quick_mode quality=2K ratio=square count=1",
@@ -335,28 +341,83 @@ function extractModels(payload: unknown) {
   return models
 }
 
+type HttpProbe = {
+  ok: boolean
+  status: number | null
+  body: string
+  error?: string
+  json?: unknown
+}
+
+async function httpProbe(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 20_000,
+): Promise<HttpProbe> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    clearTimeout(timer)
+    const body = await response.text()
+    let json: unknown
+    try {
+      json = JSON.parse(body)
+    } catch {
+      json = undefined
+    }
+    return { ok: response.ok, status: response.status, body, json }
+  } catch (err: any) {
+    clearTimeout(timer)
+    const message =
+      err?.name === "AbortError"
+        ? `Timeout after ${timeoutMs / 1000}s`
+        : String(err?.message || err)
+    return { ok: false, status: null, body: "", error: message }
+  }
+}
+
+function classifyAuthFailure(status: number | null, body: string) {
+  if (status === 401 || status === 403) return "auth" as const
+  const lower = (body || "").toLowerCase()
+  if (
+    /invalid api key|incorrect api key|unauthorized|authentication|not authenticated|invalid_api_key|permission denied|access denied/.test(
+      lower,
+    )
+  ) {
+    return "auth" as const
+  }
+  return null
+}
+
+function extractErrorMessage(body: string, json: unknown) {
+  if (json && typeof json === "object") {
+    const obj = json as any
+    const msg = obj.error?.message || obj.message || obj.error
+    if (typeof msg === "string" && msg.trim()) return msg.trim()
+  }
+  const trimmed = (body || "").trim()
+  if (!trimmed) return "(empty body)"
+  return trimmed.length > 400 ? `${trimmed.slice(0, 400)}...` : trimmed
+}
+
 async function queryModels(api: ResolvedApi) {
   if (!api.modelsEndpoint) throw new Error("API host is not configured.")
   const headers: Record<string, string> = { Accept: "application/json" }
   if (api.key) headers.Authorization = `Bearer ${api.key}`
-  const response = await fetch(api.modelsEndpoint, { method: "GET", headers })
-  if (!response.ok) {
-    const body = await response.text()
-    let message = body
-    try {
-      message = JSON.parse(body).error?.message || body
-    } catch {
-      /* keep */
-    }
-    throw new Error(`Model query failed HTTP ${response.status}: ${message}`)
+  const probe = await httpProbe(api.modelsEndpoint, { method: "GET", headers })
+  if (probe.error) {
+    throw new Error(`Model query network error: ${probe.error}`)
   }
-  let payload: unknown
-  try {
-    payload = await response.json()
-  } catch {
+  if (!probe.ok) {
+    throw new Error(
+      `Model query failed HTTP ${probe.status}: ${extractErrorMessage(probe.body, probe.json)}`,
+    )
+  }
+  if (probe.json === undefined) {
     throw new Error("Model-list endpoint did not return valid JSON.")
   }
-  const models = extractModels(payload)
+  const models = extractModels(probe.json)
   return {
     modelsEndpoint: api.modelsEndpoint,
     selectedModel: api.model,
@@ -365,6 +426,228 @@ async function queryModels(api: ResolvedApi) {
     likelyImageModels: models.filter((m) => m.likelyImageModel).map((m) => m.id),
     models,
   }
+}
+
+type VerifyResult = {
+  valid: boolean
+  level: "ok_models" | "ok_auth_no_models" | "invalid_auth" | "invalid_host" | "uncertain"
+  summary: string
+  details: string[]
+  models?: Awaited<ReturnType<typeof queryModels>>
+}
+
+/**
+ * Validate host+key:
+ * 1) GET /models — success with parseable list => OK
+ * 2) If models fails, do NOT assume key is wrong:
+ *    - network/DNS/timeout => host/url problem
+ *    - 401/403 => key problem
+ *    - otherwise probe POST image endpoint (auth / reachability)
+ */
+async function verifyConnection(api: ResolvedApi): Promise<VerifyResult> {
+  if (!api.hasHost || !api.endpoint || !api.modelsEndpoint) {
+    return {
+      valid: false,
+      level: "invalid_host",
+      summary: "Host is not configured.",
+      details: ["Set host via image_configure action=set_api host=..."],
+    }
+  }
+  if (!api.hasKey || !api.key) {
+    return {
+      valid: false,
+      level: "invalid_auth",
+      summary: "API key is not configured.",
+      details: ["Set key via image_configure action=set_key or set_api key=..."],
+    }
+  }
+
+  const details: string[] = [
+    `Endpoint: ${api.endpoint}`,
+    `Models:   ${api.modelsEndpoint}`,
+    `Key:      ${previewSecret(api.key)}`,
+  ]
+
+  // --- Step 1: models list ---
+  const modelsHeaders: Record<string, string> = {
+    Accept: "application/json",
+    Authorization: `Bearer ${api.key}`,
+  }
+  const modelsProbe = await httpProbe(api.modelsEndpoint, { method: "GET", headers: modelsHeaders })
+
+  if (modelsProbe.error) {
+    return {
+      valid: false,
+      level: "invalid_host",
+      summary: "Cannot reach the API host (network/DNS/timeout).",
+      details: [
+        ...details,
+        `Models GET error: ${modelsProbe.error}`,
+        "Check host/protocol/port. Key was not proven invalid yet.",
+      ],
+    }
+  }
+
+  if (modelsProbe.ok) {
+    try {
+      const models = extractModels(modelsProbe.json)
+      const listed = {
+        modelsEndpoint: api.modelsEndpoint,
+        selectedModel: api.model,
+        selectedModelAvailable: models.some((m) => m.id === api.model),
+        count: models.length,
+        likelyImageModels: models.filter((m) => m.likelyImageModel).map((m) => m.id),
+        models,
+      }
+      return {
+        valid: true,
+        level: "ok_models",
+        summary: `Connection valid. Model list OK (${listed.count} models).`,
+        details: [
+          ...details,
+          "GET /models succeeded — host and key look good.",
+          listed.likelyImageModels.length
+            ? `Likely image models: ${listed.likelyImageModels.slice(0, 8).join(", ")}${listed.likelyImageModels.length > 8 ? " ..." : ""}`
+            : "No name-heuristic image models; show full list via image_list_models.",
+        ],
+        models: listed,
+      }
+    } catch (err: any) {
+      // 200 but unusable body — fall through to image probe
+      details.push(`GET /models returned 200 but list parse failed: ${err?.message || err}`)
+    }
+  } else {
+    const auth = classifyAuthFailure(modelsProbe.status, modelsProbe.body)
+    if (auth === "auth") {
+      return {
+        valid: false,
+        level: "invalid_auth",
+        summary: "API key rejected by /models (401/403 or auth error).",
+        details: [
+          ...details,
+          `HTTP ${modelsProbe.status}: ${extractErrorMessage(modelsProbe.body, modelsProbe.json)}`,
+          "Ask the user for a new key, or cancel setup.",
+        ],
+      }
+    }
+    details.push(
+      `GET /models not usable (HTTP ${modelsProbe.status}): ${extractErrorMessage(modelsProbe.body, modelsProbe.json)}`,
+      "Some providers do not expose /models — running image-endpoint auth probe...",
+    )
+  }
+
+  // --- Step 2: image endpoint probe (auth/reachability, not a real generation) ---
+  if (!api.endpoint) {
+    return {
+      valid: false,
+      level: "invalid_host",
+      summary: "Image endpoint is missing.",
+      details,
+    }
+  }
+
+  const probeModel = api.model || "connection-probe"
+  const imageProbe = await httpProbe(
+    api.endpoint,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${api.key}`,
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: probeModel,
+        prompt: "connection probe",
+        n: 1,
+        size: "1024x1024",
+      }),
+    },
+    30_000,
+  )
+
+  if (imageProbe.error) {
+    return {
+      valid: false,
+      level: "invalid_host",
+      summary: "Cannot reach the image API endpoint (network/DNS/timeout).",
+      details: [...details, `POST image error: ${imageProbe.error}`, "Check host/path/protocol/port."],
+    }
+  }
+
+  const imageAuth = classifyAuthFailure(imageProbe.status, imageProbe.body)
+  if (imageAuth === "auth") {
+    return {
+      valid: false,
+      level: "invalid_auth",
+      summary: "API key rejected by the image endpoint.",
+      details: [
+        ...details,
+        `POST image HTTP ${imageProbe.status}: ${extractErrorMessage(imageProbe.body, imageProbe.json)}`,
+        "Host is reachable; key looks wrong. Ask for a new key or cancel setup.",
+      ],
+    }
+  }
+
+  // Auth not clearly rejected: treat as connection OK enough to continue without model catalog
+  if (imageProbe.status !== null && imageProbe.status < 500) {
+    return {
+      valid: true,
+      level: "ok_auth_no_models",
+      summary:
+        "Host reachable and key not rejected. /models is unavailable or unusable; user must provide model id manually.",
+      details: [
+        ...details,
+        `POST image probe HTTP ${imageProbe.status}: ${extractErrorMessage(imageProbe.body, imageProbe.json)}`,
+        "This usually means the site has no public model list (or different path), not necessarily a bad key.",
+        "Next: ask user for a model id they know works, then set_model.",
+        "Optional: try a different models_path via set_api.",
+      ],
+    }
+  }
+
+  return {
+    valid: false,
+    level: "uncertain",
+    summary: "Could not confirm the connection (server error on image probe).",
+    details: [
+      ...details,
+      `POST image HTTP ${imageProbe.status}: ${extractErrorMessage(imageProbe.body, imageProbe.json)}`,
+      "May be temporary server issue, wrong path, or provider outage.",
+      "User may retry, fix path, or cancel setup.",
+    ],
+  }
+}
+
+function formatVerifyResult(result: VerifyResult) {
+  const lines = [
+    `Verify: ${result.valid ? "PASS" : "FAIL"} (${result.level})`,
+    result.summary,
+    "",
+    ...result.details,
+    "",
+    "User may cancel setup anytime (退出配置 / cancel) and pause image work.",
+  ]
+  if (result.models && result.models.count > 0) {
+    lines.push(
+      "",
+      "Likely image models:",
+      ...(result.models.likelyImageModels.length
+        ? result.models.likelyImageModels.map((id, i) => `  ${i + 1}. ${id}`)
+        : ["  (none by name heuristic)"]),
+      "",
+      "Next: ask user to pick one, then image_configure action=set_model model=<id>",
+      "Or image_list_models for the full list.",
+    )
+  } else if (result.valid && result.level === "ok_auth_no_models") {
+    lines.push(
+      "",
+      "Next: ask user for a known model id on this provider, then set_model.",
+    )
+  } else if (!result.valid) {
+    lines.push("", "Next: fix host/key based on the error above, re-run set_api, or cancel setup.")
+  }
+  return lines.join("\n")
 }
 
 async function generateOne(
@@ -609,8 +892,9 @@ export const ImageGenPlugin: Plugin = async () => {
       image_status: tool({
         description: [
           "Show Image Gen setup status (host/key/model). Call first when the user wants images.",
-          "If incomplete, follow setup: set_api (key+host, no model) -> image_list_models -> set_model.",
-          "Never ask the user to invent a model id; always list from the provider when possible.",
+          "If incomplete: set_api (key+host) with auto-verify -> list/pick model -> generate.",
+          "Always tell the user they may cancel setup and pause image work.",
+          "Never invent model ids; list from provider when /models works.",
         ].join(" "),
         args: {},
         async execute() {
@@ -623,14 +907,15 @@ export const ImageGenPlugin: Plugin = async () => {
       image_configure: tool({
         description: [
           "Configure Image Gen (local config file).",
-          "Actions: set_key | set_api | set_model | set_quick_mode | set_batch_mode.",
-          "First-time: set_api with host+key only (omit model). Then image_list_models, then set_model.",
-          "Do not require the user to provide a model id before listing models.",
+          "Actions: set_key | set_api | set_model | set_quick_mode | set_batch_mode | verify.",
+          "First-time: set_api with host+key only (omit model). Verifies connection after save.",
+          "Verification: tries /models first; if that fails, probes image endpoint (models missing != bad key).",
+          "If invalid, tell the user and allow cancel/exit setup (暂停任务).",
           "Do not generate images with this tool.",
         ].join(" "),
         args: {
           action: tool.schema
-            .enum(["set_key", "set_api", "set_model", "set_quick_mode", "set_batch_mode"])
+            .enum(["set_key", "set_api", "set_model", "set_quick_mode", "set_batch_mode", "verify"])
             .describe("Configuration action"),
           key: tool.schema.string().optional().describe("API key (set_key / set_api)"),
           protocol: tool.schema.enum(["http", "https"]).optional().describe("set_api"),
@@ -652,10 +937,22 @@ export const ImageGenPlugin: Plugin = async () => {
             .describe("set_quick_mode / set_batch_mode"),
           count: tool.schema.number().optional().describe("Images per prompt 1-4 (set_quick_mode)"),
           concurrency: tool.schema.number().optional().describe("Parallel jobs 1-10 (set_batch_mode)"),
+          skip_verify: tool.schema
+            .boolean()
+            .optional()
+            .describe("If true, set_api/set_key skip network verification after save."),
         },
         async execute(args) {
           try {
             const cfg = loadConfig() || {}
+
+            if (args.action === "verify") {
+              const api = resolveApiConfig(cfg, false)
+              const missing = requireConnection(api)
+              if (missing) return missing
+              const result = await verifyConnection(api)
+              return formatVerifyResult(result)
+            }
 
             if (args.action === "set_key") {
               if (!args.key?.trim()) return "Error: key is required for set_key."
@@ -663,18 +960,29 @@ export const ImageGenPlugin: Plugin = async () => {
               delete cfg.apiKey
               saveConfig(cfg)
               const api = resolveApiConfig(cfg, false)
-              const next = !api.hasHost
-                ? "Next: image_configure action=set_api host=<api-host> (model not required yet)"
-                : !api.hasModel
-                  ? "Next: image_list_models, then ask the user to pick one and set_model"
-                  : "Ready: image_generate prompt=\"...\""
-              return [
+              const lines = [
                 "API key saved.",
                 `Key: ${previewSecret(args.key.trim())}`,
                 `File: ${CONFIG_PATH}`,
                 `Endpoint: ${api.endpoint || "(host not set)"}`,
-                next,
-              ].join("\n")
+              ]
+              if (!api.hasHost) {
+                lines.push("Next: image_configure action=set_api host=<api-host> (model not required yet)")
+                lines.push("User may cancel setup anytime.")
+                return lines.join("\n")
+              }
+              if (args.skip_verify) {
+                lines.push("Verify skipped (skip_verify=true).")
+                lines.push(
+                  api.hasModel
+                    ? "Ready: image_generate"
+                    : "Next: image_list_models or image_configure action=verify",
+                )
+                return lines.join("\n")
+              }
+              const result = await verifyConnection(api)
+              lines.push("", formatVerifyResult(result))
+              return lines.join("\n")
             }
 
             if (args.action === "set_model") {
@@ -753,26 +1061,35 @@ export const ImageGenPlugin: Plugin = async () => {
               }
               saveConfig(cfg)
 
-              const next = !saved.hasModel
-                ? [
-                    "",
-                    "Connection saved. Model not set yet — that is expected.",
-                    "Next:",
-                    "  1) image_list_models",
-                    "  2) Ask the user to choose from the list (prefer [image?])",
-                    "  3) image_configure action=set_model model=<id>",
-                  ]
-                : ["", "Ready to generate: image_generate prompt=\"...\""]
-
-              return [
+              const lines = [
                 "API connection saved.",
                 `Endpoint: ${saved.endpoint}`,
                 `Models:   ${saved.modelsEndpoint}`,
-                `Model:    ${saved.model || "NOT SET (list models next)"}`,
+                `Model:    ${saved.model || "NOT SET"}`,
                 `Key:      ${previewSecret(saved.key) || "not set"}`,
                 `File:     ${CONFIG_PATH}`,
-                ...next,
-              ].join("\n")
+              ]
+
+              if (!saved.hasKey) {
+                lines.push("", "Key still missing. Ask for key or cancel setup.")
+                return lines.join("\n")
+              }
+
+              if (args.skip_verify) {
+                lines.push("", "Verify skipped (skip_verify=true). Run image_configure action=verify when ready.")
+                return lines.join("\n")
+              }
+
+              const result = await verifyConnection(saved)
+              lines.push("", formatVerifyResult(result))
+              if (!result.valid) {
+                lines.push(
+                  "",
+                  "Config was still saved so the user can edit host/key and retry.",
+                  "If they want to stop: accept cancel and pause image generation.",
+                )
+              }
+              return lines.join("\n")
             }
 
             if (args.action === "set_quick_mode") {
