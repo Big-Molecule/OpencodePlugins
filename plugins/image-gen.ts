@@ -4,7 +4,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  statSync,
   writeFileSync,
 } from "node:fs"
 import { basename, dirname, join } from "node:path"
@@ -285,42 +284,8 @@ function resolveSize(quality: string, ratio: string) {
 }
 
 function resolveOutputDir(userDir?: string) {
-  let dir = (userDir?.trim() || join(homedir(), "Pictures", "image-gen")).replace(
-    /^["']|["']$/g,
-    "",
-  )
-  // If the model passes a file path by mistake, use its parent directory.
-  if (/\.(png|jpe?g|webp|gif|bmp)$/i.test(dir)) {
-    dir = dirname(dir)
-  }
-
-  try {
-    if (existsSync(dir)) {
-      const st = statSync(dir)
-      if (st.isDirectory()) return dir
-      throw new Error(`output_dir exists but is not a directory: ${dir}`)
-    }
-  } catch (err: any) {
-    if (err?.message?.includes("not a directory")) throw err
-    // exists/stat failed — still try to create below
-  }
-
-  try {
-    mkdirSync(dir, { recursive: true })
-  } catch (err: any) {
-    // Known Windows/Node edge cases: existing dir, readonly attrs, reparse points.
-    // If the path is already a directory, treat as success.
-    try {
-      if (existsSync(dir) && statSync(dir).isDirectory()) return dir
-    } catch {
-      /* fall through */
-    }
-    const code = err?.code || "ERR"
-    throw new Error(
-      `Cannot use output_dir "${dir}" (${code}: ${err?.message || err}). ` +
-        `Pass an existing folder path (e.g. Desktop), not a filename.`,
-    )
-  }
+  const dir = userDir?.trim() || join(homedir(), "Pictures", "image-gen")
+  mkdirSync(dir, { recursive: true })
   return dir
 }
 
