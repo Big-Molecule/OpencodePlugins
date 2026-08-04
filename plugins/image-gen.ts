@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from "node:fs"
 import { basename, dirname, join } from "node:path"
@@ -285,6 +286,14 @@ function resolveSize(quality: string, ratio: string) {
 
 function resolveOutputDir(userDir?: string) {
   const dir = userDir?.trim() || join(homedir(), "Pictures", "image-gen")
+  // Existing paths like Desktop must work: recursive mkdir is normally fine,
+  // but we short-circuit when the target is already a directory.
+  if (existsSync(dir)) {
+    if (!statSync(dir).isDirectory()) {
+      throw new Error(`output_dir exists but is not a directory: ${dir}`)
+    }
+    return dir
+  }
   mkdirSync(dir, { recursive: true })
   return dir
 }
