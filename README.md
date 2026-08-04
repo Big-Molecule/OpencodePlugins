@@ -74,13 +74,13 @@ Then restart OpenCode.
 | `image_generate` | Generate (single or batch) |
 | `image_edit` | Edit local image via data URL + prompt |
 
-**Standard flow**
+**Standard flow** (do not ask the user to invent a model id)
 
-1. `image_status` — if no key, configure first.
-2. Optional: `image_list_models` → `image_configure` `set_model`.
-3. Optional: `set_quick_mode` (quality / ratio / count).
-4. `image_generate` with a prompt (uses quick defaults when flags omitted).
-5. Edit: `image_edit` with `image_path` + prompt.
+1. `image_status`
+2. If incomplete: collect **API key + host only** → `image_configure` `set_api` (**omit model**)
+3. `image_list_models` → show numbered list (prefer `[image?]`) → user picks
+4. `image_configure` `set_model` with the chosen id
+5. Optional: `set_quick_mode` → `image_generate` / `image_edit`
 
 **Config (OpenCode only)**
 

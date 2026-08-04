@@ -15,11 +15,11 @@ const CONFIG_PATH = join(homedir(), ".config", "opencode", "image-gen.json")
 // Never load Codex or other product config files.
 const DEFAULT_API = Object.freeze({
   protocol: "https",
-  host: "api.example.com",
+  host: "",
   port: null as number | null,
   path: "/v1/images/generations",
   modelsPath: "/v1/models",
-  model: "your-image-model",
+  model: "",
 })
 
 const API_ENV = Object.freeze({
@@ -69,13 +69,16 @@ type ResolvedApi = {
   host: string
   port: number | null
   path: string
-  endpoint: string
+  endpoint: string | null
   modelsPath: string
-  modelsEndpoint: string
+  modelsEndpoint: string | null
   key: string | null
   keySource: string | null
-  model: string
-  modelSource: string
+  model: string | null
+  modelSource: string | null
+  hasHost: boolean
+  hasKey: boolean
+  hasModel: boolean
 }
 
 function firstDefined<T>(...values: Array<T | undefined | null | "">): T | undefined {
@@ -96,9 +99,13 @@ function normalizeProtocol(value: unknown) {
   return protocol
 }
 
-function normalizeHost(value: unknown) {
+function normalizeHost(value: unknown, { required = true } = {}) {
   const host = String(value || "").trim()
-  if (!host || host.includes("://") || /[/?#@\s]/.test(host)) {
+  if (!host) {
+    if (required) throw new Error("API host is required (domain, IP, or localhost, no scheme/path).")
+    return ""
+  }
+  if (host.includes("://") || /[/?#@\s]/.test(host)) {
     throw new Error("API host must be a domain, IP, or localhost without scheme/path.")
   }
   if (host.includes(":") && !(host.startsWith("[") && host.endsWith("]"))) {
@@ -124,9 +131,12 @@ function normalizePath(value: unknown) {
   return `/${p.replace(/^\/+/, "")}`
 }
 
-function normalizeModel(value: unknown) {
+function normalizeModel(value: unknown, { required = true } = {}) {
   const model = String(value || "").trim()
-  if (!model) throw new Error("API model must not be empty.")
+  if (!model) {
+    if (required) throw new Error("API model must not be empty.")
+    return ""
+  }
   return model
 }
 
@@ -155,29 +165,29 @@ function setupGuide(reason: string) {
     reason,
     "",
     `OpenCode config only: ${CONFIG_PATH}`,
-    "(Does not read Codex or other apps' config.)",
     "",
-    "1) Save API connection (recommended once):",
-    "   image_configure action=set_api",
-    "     protocol=https",
-    "     host=<your-api-host>",
-    "     port=default",
-    "     path=/v1/images/generations",
-    "     models_path=/v1/models",
-    "     model=<image-model-id>",
-    "     key=<api-key>",
+    "Do NOT ask the user to invent a model id first.",
+    "Flow: connection (key+host) -> list models from API -> user picks one.",
     "",
-    "2) Or only set key if endpoint defaults are already written:",
-    "   image_configure action=set_key key=<api-key>",
+    "Step 1 — save connection (model optional, omit it):",
+    "  image_configure action=set_api",
+    "    protocol=https",
+    "    host=<api-host only, e.g. api.example.com>",
+    "    key=<api-key>",
+    "    path=/v1/images/generations   (optional)",
+    "    models_path=/v1/models        (optional)",
     "",
-    "3) Optional quick defaults:",
-    "   image_configure action=set_quick_mode quality=2K ratio=square count=1",
+    "Step 2 — discover models from the provider:",
+    "  image_list_models",
+    "  Show the user the numbered list, especially [image?] candidates.",
+    "  Ask them to pick a number or id from that list.",
     "",
-    "4) Check: image_status",
-    "5) Generate: image_generate prompt=\"...\"",
+    "Step 3 — save their choice:",
+    "  image_configure action=set_model model=<id-from-list>",
     "",
-    "Env overrides (optional, OpenCode session only):",
-    "  IMAGE_GEN_API_PROTOCOL HOST PORT PATH MODELS_PATH KEY MODEL",
+    "Step 4 — optional quick defaults, then generate:",
+    "  image_configure action=set_quick_mode quality=2K ratio=square count=1",
+    "  image_generate prompt=\"...\"",
   ].join("\n")
 }
 
@@ -200,18 +210,20 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
   )
   const host = normalizeHost(
     firstDefined(env[API_ENV.host], stored.host, stored.domain, DEFAULT_API.host),
+    { required: false },
   )
   const port = normalizePort(firstDefined(env[API_ENV.port], stored.port, DEFAULT_API.port))
   const path = normalizePath(firstDefined(env[API_ENV.path], stored.path, DEFAULT_API.path))
   const modelsPath = normalizePath(
     firstDefined(env[API_ENV.modelsPath], stored.modelsPath, DEFAULT_API.modelsPath),
   )
-  const model = normalizeModel(firstDefined(env[API_ENV.model], stored.model, DEFAULT_API.model))
+  const rawModel = firstDefined(env[API_ENV.model], stored.model, "") as string | undefined
+  const model = normalizeModel(rawModel || "", { required: false }) || null
   const modelSource = env[API_ENV.model]
     ? API_ENV.model
     : stored.model
       ? "config.api.model"
-      : "default"
+      : null
   const key =
     (firstDefined(env[API_ENV.key], stored.key, cfg?.apiKey, null) as string | null | undefined) ||
     null
@@ -223,9 +235,13 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
         ? "legacy config.apiKey"
         : null
 
-  const authority = port === null ? host : `${host}:${port}`
-  const endpoint = new URL(path, `${protocol}://${authority}/`).toString()
-  const modelsEndpoint = new URL(modelsPath, `${protocol}://${authority}/`).toString()
+  let endpoint: string | null = null
+  let modelsEndpoint: string | null = null
+  if (host) {
+    const authority = port === null ? host : `${host}:${port}`
+    endpoint = new URL(path, `${protocol}://${authority}/`).toString()
+    modelsEndpoint = new URL(modelsPath, `${protocol}://${authority}/`).toString()
+  }
 
   return {
     protocol,
@@ -239,6 +255,9 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
     keySource,
     model,
     modelSource,
+    hasHost: !!host,
+    hasKey: !!key,
+    hasModel: !!model,
   }
 }
 
@@ -250,7 +269,7 @@ function apiForStorage(api: ResolvedApi) {
     path: api.path,
     modelsPath: api.modelsPath,
     key: api.key,
-    model: api.model,
+    model: api.model || undefined,
   }
 }
 
@@ -317,6 +336,7 @@ function extractModels(payload: unknown) {
 }
 
 async function queryModels(api: ResolvedApi) {
+  if (!api.modelsEndpoint) throw new Error("API host is not configured.")
   const headers: Record<string, string> = { Accept: "application/json" }
   if (api.key) headers.Authorization = `Bearer ${api.key}`
   const response = await fetch(api.modelsEndpoint, { method: "GET", headers })
@@ -354,6 +374,9 @@ async function generateOne(
   outputDir: string,
   timeoutMs = 220_000,
 ) {
+  if (!api.endpoint || !api.model || !api.key) {
+    return { ok: false as const, elapsed: 0, error: "API host, model, and key are required." }
+  }
   const start = Date.now()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -411,6 +434,14 @@ async function editOne(
   count = 1,
   timeoutMs = 250_000,
 ) {
+  if (!api.endpoint || !api.model || !api.key) {
+    return {
+      ok: false as const,
+      elapsed: 0,
+      error: "API host, model, and key are required.",
+      sourceName: basename(imagePath),
+    }
+  }
   if (!existsSync(imagePath)) {
     return { ok: false as const, elapsed: 0, error: `File not found: ${imagePath}`, sourceName: basename(imagePath) }
   }
@@ -485,21 +516,31 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, inde
   return results
 }
 
+function setupProgress(api: ResolvedApi) {
+  return {
+    connection: api.hasHost && api.hasKey,
+    model: api.hasModel,
+    ready: api.hasHost && api.hasKey && api.hasModel,
+  }
+}
+
 function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
-  if (!configFileExists() && !api.key) {
+  if (!configFileExists() && !api.hasKey && !api.hasHost) {
     return setupGuide(`No OpenCode config file found at:\n  ${CONFIG_PATH}`)
   }
 
-  const ready = !!api.key && configFileExists()
+  const progress = setupProgress(api)
   const lines = [
     "Image Gen - status",
     "",
     `Config file: ${CONFIG_PATH}`,
     `File exists: ${configFileExists() ? "yes" : "no"}`,
-    `Ready:       ${ready ? "yes" : "no"}`,
-    `Endpoint:    ${api.endpoint}`,
-    `Models URL:  ${api.modelsEndpoint}`,
-    `Model:       ${api.model} (${api.modelSource})`,
+    `Connection:  ${progress.connection ? "ok" : "incomplete"} (host + key)`,
+    `Model:       ${progress.model ? "ok" : "not selected yet"}`,
+    `Ready:       ${progress.ready ? "yes" : "no"}`,
+    `Endpoint:    ${api.endpoint || "(host not set)"}`,
+    `Models URL:  ${api.modelsEndpoint || "(host not set)"}`,
+    `Model id:    ${api.model ? `${api.model} (${api.modelSource})` : "NOT SET — use image_list_models then set_model"}`,
     `API key:     ${api.key ? `set (${api.keySource}, ${previewSecret(api.key)})` : "NOT SET"}`,
     "",
     "Quick mode:",
@@ -511,22 +552,53 @@ function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
       ? `  quality=${cfg.batchMode.quality} ratio=${cfg.batchMode.ratio} concurrency=${cfg.batchMode.concurrency}`
       : "  not configured (defaults: 2K / square / concurrency 3)",
     "",
-    "Env overrides: IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL",
-    "",
     "Next steps:",
-    ready
-      ? "- Use image_generate with a prompt, or image_list_models to pick a model."
-      : "- Complete setup with image_configure (set_api or set_key), then image_status.",
   ]
+
+  if (!api.hasHost || !api.hasKey) {
+    lines.push("- Ask user for API key + host only (not model id).")
+    lines.push("- image_configure action=set_api host=... key=... (omit model)")
+  } else if (!api.hasModel) {
+    lines.push("- image_list_models  (discover from provider; do not invent ids)")
+    lines.push("- Ask user to pick from the numbered list")
+    lines.push("- image_configure action=set_model model=<chosen-id>")
+  } else {
+    lines.push("- image_generate prompt=\"...\"")
+    lines.push("- or image_list_models to change model")
+  }
+
   return lines.join("\n")
 }
 
-function requireReady(api: ResolvedApi) {
-  if (!configFileExists() && !process.env[API_ENV.key]) {
-    return setupGuide(`No OpenCode config file found at:\n  ${CONFIG_PATH}`)
+/** Enough to call /models (key + host). Model not required. */
+function requireConnection(api: ResolvedApi) {
+  if (!api.hasHost || !api.hasKey) {
+    return setupGuide(
+      !api.hasHost && !api.hasKey
+        ? "API host and key are not configured."
+        : !api.hasHost
+          ? "API host is not configured."
+          : "API key is not configured.",
+    )
   }
-  if (!api.key) {
-    return setupGuide("API key is not set in OpenCode config or IMAGE_GEN_API_KEY.")
+  return null
+}
+
+/** Enough to generate/edit (key + host + model). */
+function requireReady(api: ResolvedApi) {
+  const conn = requireConnection(api)
+  if (conn) return conn
+  if (!api.hasModel) {
+    return [
+      "Connection is configured, but no image model is selected yet.",
+      "",
+      "Do not ask the user to guess a model id.",
+      "1) image_list_models",
+      "2) Show the list (prefer [image?] entries) and ask them to pick one",
+      "3) image_configure action=set_model model=<id-from-list>",
+      "",
+      `Config: ${CONFIG_PATH}`,
+    ].join("\n")
   }
   return null
 }
@@ -535,8 +607,11 @@ export const ImageGenPlugin: Plugin = async () => {
   return {
     tool: {
       image_status: tool({
-        description:
-          "Show Image Gen configuration status (endpoint, model, key presence, quick/batch defaults). Call this first when the user wants to generate or edit images with Image Gen, or when checking setup. Do not use for OpenCode built-in image tools.",
+        description: [
+          "Show Image Gen setup status (host/key/model). Call first when the user wants images.",
+          "If incomplete, follow setup: set_api (key+host, no model) -> image_list_models -> set_model.",
+          "Never ask the user to invent a model id; always list from the provider when possible.",
+        ].join(" "),
         args: {},
         async execute() {
           const cfg = loadConfig()
@@ -547,9 +622,10 @@ export const ImageGenPlugin: Plugin = async () => {
 
       image_configure: tool({
         description: [
-          "Configure Image Gen (local config file, no network except validation).",
+          "Configure Image Gen (local config file).",
           "Actions: set_key | set_api | set_model | set_quick_mode | set_batch_mode.",
-          "Use when the user provides API key, endpoint, model, or default quality/ratio.",
+          "First-time: set_api with host+key only (omit model). Then image_list_models, then set_model.",
+          "Do not require the user to provide a model id before listing models.",
           "Do not generate images with this tool.",
         ].join(" "),
         args: {
@@ -565,7 +641,10 @@ export const ImageGenPlugin: Plugin = async () => {
             .describe('Port number or "default" (set_api)'),
           path: tool.schema.string().optional().describe("Image generations path, e.g. /v1/images/generations"),
           models_path: tool.schema.string().optional().describe("Models list path, e.g. /v1/models"),
-          model: tool.schema.string().optional().describe("Image model id (set_model / set_api)"),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe("Image model id. Prefer set_model after image_list_models; optional on set_api."),
           quality: tool.schema.enum(["1K", "2K", "4K"]).optional().describe("set_quick_mode / set_batch_mode"),
           ratio: tool.schema
             .enum(["square", "landscape", "portrait"])
@@ -584,25 +663,45 @@ export const ImageGenPlugin: Plugin = async () => {
               delete cfg.apiKey
               saveConfig(cfg)
               const api = resolveApiConfig(cfg, false)
+              const next = !api.hasHost
+                ? "Next: image_configure action=set_api host=<api-host> (model not required yet)"
+                : !api.hasModel
+                  ? "Next: image_list_models, then ask the user to pick one and set_model"
+                  : "Ready: image_generate prompt=\"...\""
               return [
                 "API key saved.",
                 `Key: ${previewSecret(args.key.trim())}`,
                 `File: ${CONFIG_PATH}`,
-                `Will authenticate to: ${api.endpoint}`,
+                `Endpoint: ${api.endpoint || "(host not set)"}`,
+                next,
               ].join("\n")
             }
 
             if (args.action === "set_model") {
-              if (!args.model?.trim()) return "Error: model is required for set_model."
+              if (!args.model?.trim()) return "Error: model is required for set_model. Prefer picking an id from image_list_models."
               const current = resolveApiConfig(cfg, false)
-              cfg.api = apiForStorage({ ...current, model: normalizeModel(args.model) })
+              if (!current.hasHost || !current.hasKey) {
+                return setupGuide("Set host + key before selecting a model.")
+              }
+              cfg.api = apiForStorage({
+                ...current,
+                model: normalizeModel(args.model),
+                hasModel: true,
+              } as ResolvedApi)
+              // preserve model string explicitly
+              cfg.api = {
+                ...cfg.api,
+                model: normalizeModel(args.model),
+              }
               delete cfg.apiKey
               saveConfig(cfg)
               return [
-                "Image model updated.",
-                `Model: ${cfg.api.model}`,
+                "Image model saved.",
+                `Model:    ${normalizeModel(args.model)}`,
                 `Endpoint: ${current.endpoint}`,
-                `File: ${CONFIG_PATH}`,
+                `File:     ${CONFIG_PATH}`,
+                "",
+                "You can generate now: image_generate prompt=\"...\"",
               ].join("\n")
             }
 
@@ -616,29 +715,63 @@ export const ImageGenPlugin: Plugin = async () => {
                 args.model,
                 args.key,
               ].some((v) => v !== undefined && v !== null && String(v).length > 0)
-              if (!hasAny) return "Error: set_api requires at least one of protocol/host/port/path/models_path/model/key."
+              if (!hasAny) {
+                return "Error: set_api requires at least host and/or key (model is optional)."
+              }
 
               const current = resolveApiConfig(cfg, false)
+              const nextHost = firstDefined(args.host, current.host) || ""
+              if (args.host !== undefined) normalizeHost(args.host, { required: true })
+
               cfg.api = {
                 protocol: firstDefined(args.protocol, current.protocol),
-                host: firstDefined(args.host, current.host),
+                host: nextHost,
                 port: args.port === undefined ? current.port : normalizePort(args.port),
                 path: firstDefined(args.path, current.path),
                 modelsPath: firstDefined(args.models_path, current.modelsPath),
-                key: firstDefined(args.key, current.key),
-                model: firstDefined(args.model, current.model),
+                key: firstDefined(args.key, current.key) || undefined,
+                // model optional: only write when user provided it
+                model:
+                  args.model !== undefined
+                    ? normalizeModel(args.model)
+                    : current.model || undefined,
               }
+              if (!cfg.api.host) {
+                return "Error: host is required for a usable connection (domain/IP only, no https://)."
+              }
+              normalizeHost(cfg.api.host, { required: true })
               delete cfg.apiKey
               const saved = resolveApiConfig(cfg, false)
-              cfg.api = apiForStorage(saved)
+              cfg.api = {
+                protocol: saved.protocol,
+                host: saved.host,
+                port: saved.port,
+                path: saved.path,
+                modelsPath: saved.modelsPath,
+                key: saved.key || undefined,
+                model: saved.model || undefined,
+              }
               saveConfig(cfg)
+
+              const next = !saved.hasModel
+                ? [
+                    "",
+                    "Connection saved. Model not set yet — that is expected.",
+                    "Next:",
+                    "  1) image_list_models",
+                    "  2) Ask the user to choose from the list (prefer [image?])",
+                    "  3) image_configure action=set_model model=<id>",
+                  ]
+                : ["", "Ready to generate: image_generate prompt=\"...\""]
+
               return [
-                "API configuration saved.",
+                "API connection saved.",
                 `Endpoint: ${saved.endpoint}`,
                 `Models:   ${saved.modelsEndpoint}`,
-                `Model:    ${saved.model}`,
+                `Model:    ${saved.model || "NOT SET (list models next)"}`,
                 `Key:      ${previewSecret(saved.key) || "not set"}`,
                 `File:     ${CONFIG_PATH}`,
+                ...next,
               ].join("\n")
             }
 
@@ -693,29 +826,36 @@ export const ImageGenPlugin: Plugin = async () => {
       }),
 
       image_list_models: tool({
-        description:
-          "Query the configured OpenAI-compatible /models endpoint and list available models. Prefer models flagged as likely image models. Use when choosing or verifying an image model. Does not search the public web.",
+        description: [
+          "Query the configured OpenAI-compatible /models endpoint and list available models.",
+          "Use AFTER host+key are saved, and BEFORE asking the user for a model id.",
+          "Prefer models flagged [image?]. Present a numbered list and let the user pick;",
+          "then call image_configure set_model. Requires connection only (not a selected model).",
+          "Does not search the public web.",
+        ].join(" "),
         args: {},
         async execute() {
           try {
             const api = resolveApiConfig()
-            const missing = requireReady(api)
+            const missing = requireConnection(api)
             if (missing) return missing
             const result = await queryModels(api)
             const lines = [
               `Models endpoint: ${result.modelsEndpoint}`,
-              `Selected model:  ${result.selectedModel} (${result.selectedModelAvailable ? "present in list" : "not in list"})`,
-              `Total models:    ${result.count}`,
+              `Currently selected: ${result.selectedModel || "none"} (${result.selectedModel ? (result.selectedModelAvailable ? "in list" : "not in list") : "n/a"})`,
+              `Total models: ${result.count}`,
               "",
-              "Likely image models:",
+              "Likely image models (prefer these):",
               ...(result.likelyImageModels.length
                 ? result.likelyImageModels.map((id, i) => `  ${i + 1}. ${id}`)
-                : ["  (none matched name heuristics)"]),
+                : ["  (none matched name heuristics — show full list below)"]),
               "",
               "All models:",
               ...result.models.map((m, i) => `  ${i + 1}. ${m.id}${m.likelyImageModel ? "  [image?]" : ""}`),
               "",
-              "To select: image_configure action=set_model model=<id>",
+              "Ask the user which number/id to use, then:",
+              "  image_configure action=set_model model=<id-from-list>",
+              "Do not invent model ids that are not in this list.",
             ]
             return lines.join("\n")
           } catch (err: any) {
@@ -728,7 +868,7 @@ export const ImageGenPlugin: Plugin = async () => {
         description: [
           "Generate image(s) via the configured OpenAI-compatible image API (b64_json response).",
           "Use when the user wants to create/draw images with Image Gen.",
-          "Requires API key (image_status / image_configure first if missing).",
+          "Requires host+key+model. If model missing, run image_list_models and set_model first.",
           "quality: 1K|2K|4K; ratio: square|landscape|portrait; count 1-4 variations of the same prompt.",
           "For multiple different prompts, pass prompts as a JSON array string in batch_prompts.",
         ].join(" "),
