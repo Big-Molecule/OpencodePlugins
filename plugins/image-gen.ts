@@ -10,18 +10,16 @@ import { basename, dirname, join } from "node:path"
 import { homedir } from "node:os"
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "image-gen.json")
-const LEGACY_CONFIG_PATHS = [
-  join(homedir(), ".codex", "niu-image-gen-config.json"),
-  join(homedir(), ".codex", "image-gen-config.json"),
-]
 
+// Placeholder defaults only for display before the user configures OpenCode.
+// Never load Codex or other product config files.
 const DEFAULT_API = Object.freeze({
   protocol: "https",
-  host: "api.iiiiitoken.com",
+  host: "api.example.com",
   port: null as number | null,
   path: "/v1/images/generations",
   modelsPath: "/v1/models",
-  model: "gpt-image-2-x",
+  model: "your-image-model",
 })
 
 const API_ENV = Object.freeze({
@@ -138,16 +136,49 @@ function previewSecret(value: string | null | undefined) {
   return `${value.slice(0, 8)}...${value.slice(-4)}`
 }
 
+function configFileExists() {
+  return existsSync(CONFIG_PATH)
+}
+
 function loadConfig(): StoredConfig | null {
-  for (const path of [CONFIG_PATH, ...LEGACY_CONFIG_PATHS]) {
-    if (!existsSync(path)) continue
-    try {
-      return JSON.parse(readFileSync(path, "utf-8")) as StoredConfig
-    } catch {
-      /* try next */
-    }
+  if (!configFileExists()) return null
+  try {
+    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as StoredConfig
+  } catch {
+    return null
   }
-  return null
+}
+
+function setupGuide(reason: string) {
+  return [
+    "Image Gen setup required",
+    reason,
+    "",
+    `OpenCode config only: ${CONFIG_PATH}`,
+    "(Does not read Codex or other apps' config.)",
+    "",
+    "1) Save API connection (recommended once):",
+    "   image_configure action=set_api",
+    "     protocol=https",
+    "     host=<your-api-host>",
+    "     port=default",
+    "     path=/v1/images/generations",
+    "     models_path=/v1/models",
+    "     model=<image-model-id>",
+    "     key=<api-key>",
+    "",
+    "2) Or only set key if endpoint defaults are already written:",
+    "   image_configure action=set_key key=<api-key>",
+    "",
+    "3) Optional quick defaults:",
+    "   image_configure action=set_quick_mode quality=2K ratio=square count=1",
+    "",
+    "4) Check: image_status",
+    "5) Generate: image_generate prompt=\"...\"",
+    "",
+    "Env overrides (optional, OpenCode session only):",
+    "  IMAGE_GEN_API_PROTOCOL HOST PORT PATH MODELS_PATH KEY MODEL",
+  ].join("\n")
 }
 
 function saveConfig(cfg: StoredConfig) {
@@ -455,10 +486,17 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, inde
 }
 
 function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
+  if (!configFileExists() && !api.key) {
+    return setupGuide(`No OpenCode config file found at:\n  ${CONFIG_PATH}`)
+  }
+
+  const ready = !!api.key && configFileExists()
   const lines = [
     "Image Gen - status",
     "",
     `Config file: ${CONFIG_PATH}`,
+    `File exists: ${configFileExists() ? "yes" : "no"}`,
+    `Ready:       ${ready ? "yes" : "no"}`,
     `Endpoint:    ${api.endpoint}`,
     `Models URL:  ${api.modelsEndpoint}`,
     `Model:       ${api.model} (${api.modelSource})`,
@@ -476,20 +514,19 @@ function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
     "Env overrides: IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL",
     "",
     "Next steps:",
-    api.key
+    ready
       ? "- Use image_generate with a prompt, or image_list_models to pick a model."
-      : "- Call image_configure with action=set_key (or set_api) before generating.",
+      : "- Complete setup with image_configure (set_api or set_key), then image_status.",
   ]
   return lines.join("\n")
 }
 
-function requireKey(api: ResolvedApi) {
+function requireReady(api: ResolvedApi) {
+  if (!configFileExists() && !process.env[API_ENV.key]) {
+    return setupGuide(`No OpenCode config file found at:\n  ${CONFIG_PATH}`)
+  }
   if (!api.key) {
-    return [
-      "API key is not configured.",
-      `Set env ${API_ENV.key}, or call image_configure with action=set_key / set_api.`,
-      `Config path: ${CONFIG_PATH}`,
-    ].join("\n")
+    return setupGuide("API key is not set in OpenCode config or IMAGE_GEN_API_KEY.")
   }
   return null
 }
@@ -662,6 +699,8 @@ export const ImageGenPlugin: Plugin = async () => {
         async execute() {
           try {
             const api = resolveApiConfig()
+            const missing = requireReady(api)
+            if (missing) return missing
             const result = await queryModels(api)
             const lines = [
               `Models endpoint: ${result.modelsEndpoint}`,
@@ -709,7 +748,7 @@ export const ImageGenPlugin: Plugin = async () => {
           try {
             const cfg = loadConfig()
             const api = resolveApiConfig(cfg)
-            const missing = requireKey(api)
+            const missing = requireReady(api)
             if (missing) return missing
 
             let prompts: string[] = []
@@ -809,7 +848,7 @@ export const ImageGenPlugin: Plugin = async () => {
           try {
             const cfg = loadConfig()
             const api = resolveApiConfig(cfg)
-            const missing = requireKey(api)
+            const missing = requireReady(api)
             if (missing) return missing
             if (!args.image_path?.trim()) return "Error: image_path is required."
             if (!args.prompt?.trim()) return "Error: prompt is required."

@@ -82,9 +82,10 @@ Then restart OpenCode.
 4. `image_generate` with a prompt (uses quick defaults when flags omitted).
 5. Edit: `image_edit` with `image_path` + prompt.
 
-**Config**
+**Config (OpenCode only)**
 
-- File: `~/.config/opencode/image-gen.json`
+- File: `~/.config/opencode/image-gen.json` only — does **not** read Codex `~/.codex/*`.
+- If the file is missing or key is unset, tools return a setup guide via `image_status` / generate/edit/list.
 - Env overrides: `IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL`
 - Default output dir: `~/Pictures/image-gen/`
 - API must accept JSON `{ model, prompt, n, size }` and return `data[].b64_json`; edit adds `image` data URL.
