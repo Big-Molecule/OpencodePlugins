@@ -22,3 +22,6 @@ node_modules/
 # Everything ES download leftovers (if ever placed in-repo by mistake)
 es.exe
 es.zip
+
+# Office docs job cache (workdir-local)
+.opencode-office/

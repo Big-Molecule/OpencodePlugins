@@ -8,103 +8,80 @@ Personal OpenCode plugins, managed with Git for backup and machine sync.
 
 ```text
 OpenCodePlugins/
-├── plugins/                 # development source (git)
+├── plugins/
 │   ├── everything-search.ts
-│   └── image-gen.ts
+│   ├── image-gen.ts
+│   └── office-docs.ts
+├── skills/
+│   └── office-docs/SKILL.md
 └── scripts/
-    ├── install.ps1          # copy *.ts/*.js -> ~/.config/opencode/plugins
-    └── office/              # DOCX page preview (Word COM + pdftoppm)
+    ├── install.ps1
+    └── office/                 # DOCX edit helpers + Word COM render
+        ├── setup-venv.ps1
         ├── render-docx.ps1
         ├── export-docx-pdf.vbs
-        └── README.md
+        └── py/
 ```
 
-OpenCode auto-loads `*.ts` / `*.js` from:
-
-- Global: `~/.config/opencode/plugins/`
-- Project: `.opencode/plugins/`
-
-## Workflow
-
-1. Develop under `plugins/` in this repository.
-2. When a plugin is ready, install (copy) it:
+## Install
 
 ```powershell
 cd E:\Projects\Current\OpenCodePlugins
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Install one file only:
+Then **restart OpenCode**.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Plugin image-gen.ts
-```
+`install.ps1` also syncs:
 
-3. Restart OpenCode (plugins are not hot-reloaded).
-
-Incomplete work stays in the repo and is **not** used until you run `install.ps1` again.
-
-## New machine
-
-```powershell
-git clone <your-repo-url> E:\Projects\Current\OpenCodePlugins
-cd E:\Projects\Current\OpenCodePlugins
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
-```
-
-Then restart OpenCode.
+- office scripts → `%LOCALAPPDATA%\opencode-office\scripts`
+- skill → `~\.config\opencode\skills\office-docs`
 
 ## Plugins
 
 | File | Tools | Description |
 |------|-------|-------------|
-| `everything-search.ts` | `everything_search` | Windows global filename search via Everything / `es.exe`. |
-| `image-gen.ts` | `image_*` | OpenAI-compatible image generate/edit. |
+| `everything-search.ts` | `everything_search` | Windows global filename search via Everything |
+| `image-gen.ts` | `image_*` | OpenAI-compatible image generate/edit |
+| `office-docs.ts` | `office_*` | DOCX edit (venv python-docx) + Word COM page render (Codex-style) |
 
-### everything-search
+### office-docs (Codex-style)
 
-1. Prefer Everything + `es.exe` for whole-machine / cross-drive filename lookup.
-2. If Everything is missing → explain and fall back to slow OS search.
-3. If Everything exists but `es.exe` is missing → explain why ES is needed; only install when the user agrees (`install_es=true`).
-4. Optional env: `EVERYTHING_ES_PATH` = full path to `es.exe`.
-
-### image-gen
+**Golden path:** edit → `office_render` `all_pages=true` → inspect PNGs → fix → deliver DOCX.
 
 | Tool | Purpose |
 |------|---------|
-| `image_status` | Show config / key presence / defaults |
-| `image_configure` | `set_key` / `set_api` / `set_model` / `set_quick_mode` / `set_batch_mode` |
-| `image_list_models` | Query configured `/v1/models` |
-| `image_generate` | Generate (single or batch) |
-| `image_edit` | Edit local image via data URL + prompt |
+| `office_status` | Readiness |
+| `office_setup` | System Python → dedicated venv; probe Word; sync scripts |
+| `office_verify` | Re-check imports + Word COM |
+| `office_docx_info` | Paragraph/table summary |
+| `office_docx_create` | Create simple DOCX |
+| `office_docx_edit` | set/add paragraphs |
+| `office_render` | DOCX → page PNGs via Word COM + pdftoppm |
 
-**Standard flow** (do not ask the user to invent a model id)
+**Paths**
 
-1. `image_status`
-2. Collect **API key + host only** → `image_configure` `set_api` (**omit model**)
-3. Auto-verify after save:
-   - `/models` OK → connection valid; show model candidates
-   - `/models` fail → image-endpoint auth probe (missing models ≠ bad key)
-   - auth fail / host unreachable → tell user; allow **cancel setup**
-4. Pick model: from list, or manual id if provider has no catalog
-5. Optional: `set_quick_mode` → `image_generate` / `image_edit`
+| What | Where |
+|------|--------|
+| Config | `~\.config\opencode\office-docs.json` |
+| Venv | `%LOCALAPPDATA%\opencode-office\venv` |
+| Scripts | `%LOCALAPPDATA%\opencode-office\scripts` |
+| Job temp | `<workdir>/.opencode-office/cache/<jobId>/` |
 
-User may exit setup anytime (退出配置 / cancel); do not continue image work until they resume.
+**Requires:** Python ≥ 3.10 on machine, Microsoft Word, pdftoppm (poppler; auto-detects Codex cache if present).
 
-Manual re-check: `image_configure action=verify`  
-Skip network check: `skip_verify=true` on set_api/set_key.
+Does **not** pollute project venv. No Google Drive / marketplace.
 
-**Config (OpenCode only)**
+### image-gen
 
-- File: `~/.config/opencode/image-gen.json` only — does **not** read Codex `~/.codex/*`.
-- If the file is missing or key is unset, tools return a setup guide via `image_status` / generate/edit/list.
-- Env overrides: `IMAGE_GEN_API_PROTOCOL|HOST|PORT|PATH|MODELS_PATH|KEY|MODEL`
-- Default output dir: `~/Pictures/image-gen/`
-- API must accept JSON `{ model, prompt, n, size }` and return `data[].b64_json`; edit adds `image` data URL.
+See prior docs in conversation / `image_status` tool. Config: `~\.config\opencode\image-gen.json`.
+
+### everything-search
+
+Global filename search via Everything / `es.exe`.
 
 ## Notes
 
-- Do **not** junction the live plugins folder to this repo if you want a safe dev buffer.
-- Do not commit secrets or machine-specific absolute paths.
-- Local plugins do not need `plugin: [...]` in `opencode.json` (that is for npm packages).
-- `install.ps1` only copies `.ts` / `.js` / `.mjs` / `.cjs`.
+- Restart OpenCode after install.
+- Do not commit secrets.
+- Local plugins do not need `plugin: [...]` in opencode.json.

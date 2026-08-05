@@ -62,6 +62,28 @@ foreach ($file in $files) {
     }
 }
 
+# Sync office scripts to runtime (used by office-docs plugin)
+$OfficeSrc = Join-Path $RepoRoot "scripts\office"
+$OfficeDst = Join-Path $env:LOCALAPPDATA "opencode-office\scripts"
+if (Test-Path -LiteralPath $OfficeSrc) {
+    if ($PSCmdlet.ShouldProcess($OfficeDst, "Sync office scripts")) {
+        New-Item -ItemType Directory -Path $OfficeDst -Force | Out-Null
+        Copy-Item -Path (Join-Path $OfficeSrc "*") -Destination $OfficeDst -Recurse -Force
+        Write-Host "Office scripts: $OfficeDst"
+    }
+}
+
+# Sync office-docs skill (global OpenCode skills)
+$SkillSrc = Join-Path $RepoRoot "skills\office-docs"
+$SkillDst = Join-Path $ConfigDir "skills\office-docs"
+if (Test-Path -LiteralPath $SkillSrc) {
+    if ($PSCmdlet.ShouldProcess($SkillDst, "Sync office-docs skill")) {
+        New-Item -ItemType Directory -Path $SkillDst -Force | Out-Null
+        Copy-Item -Path (Join-Path $SkillSrc "*") -Destination $SkillDst -Recurse -Force
+        Write-Host "Skill: $SkillDst"
+    }
+}
+
 Write-Host ""
 Write-Host "Source (dev):  $Src"
 Write-Host "Target (live): $Dst"

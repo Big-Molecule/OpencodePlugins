@@ -3,19 +3,14 @@
 # Pipeline:
 #   1) Copy DOCX to a short ASCII work dir (avoids path encoding issues)
 #   2) cscript export-docx-pdf.vbs  -> PDF  (VBS COM is more stable than PS COM)
-#   3) pdftoppm -png -f N -l N      -> page-N.png
+#   3) pdftoppm -png                -> page-N.png
 #   4) Kill leftover WINWORD if needed
 #
 # Usage:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\render-docx.ps1 `
-#     -InputDocx "D:\path\file.docx" `
-#     -Page 1 `
-#     -OutputDir "C:\Users\...\Desktop\preview" `
-#     -Dpi 144
+#   .\render-docx.ps1 -InputDocx file.docx -Page 1 -OutputDir .\ .opencode-office\cache\job1
+#   .\render-docx.ps1 -InputDocx file.docx -AllPages -OutputDir ...
 #
-# Requires:
-#   - Microsoft Word installed (COM Word.Application)
-#   - pdftoppm.exe (auto-detected; override with -PdfToPpm)
+# Requires: Microsoft Word COM + pdftoppm.exe
 
 [CmdletBinding()]
 param(
@@ -23,6 +18,8 @@ param(
     [string]$InputDocx,
 
     [int]$Page = 1,
+
+    [switch]$AllPages,
 
     [string]$OutputDir = "",
 
@@ -45,17 +42,10 @@ function Resolve-PdfToPpm {
     }
     $candidates = @(
         "$env:LOCALAPPDATA\opencode-office\poppler\Library\bin\pdftoppm.exe",
-        "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin\pdftoppm.exe",
-        "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\pdftoppm.cmd"
+        "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin\pdftoppm.exe"
     )
     foreach ($c in $candidates) {
-        if (Test-Path -LiteralPath $c) {
-            if ($c -like "*.cmd") {
-                $exe = Join-Path (Split-Path (Split-Path (Split-Path $c))) "native\poppler\Library\bin\pdftoppm.exe"
-                if (Test-Path -LiteralPath $exe) { return $exe }
-            }
-            return $c
-        }
+        if (Test-Path -LiteralPath $c) { return $c }
     }
     $cmd = Get-Command pdftoppm.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -74,7 +64,7 @@ if (-not (Test-Path -LiteralPath $InputDocx)) {
 }
 $InputDocx = (Resolve-Path -LiteralPath $InputDocx).Path
 
-if ($Page -lt 1) { throw "Page must be >= 1" }
+if (-not $AllPages -and $Page -lt 1) { throw "Page must be >= 1" }
 if ($Dpi -lt 36 -or $Dpi -gt 600) { throw "Dpi should be between 36 and 600" }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -85,15 +75,11 @@ if (-not (Test-Path -LiteralPath $vbs)) {
 
 $pdftoppm = Resolve-PdfToPpm -Explicit $PdfToPpm
 if (-not $pdftoppm) {
-    throw @"
-pdftoppm.exe not found.
-Install poppler and pass -PdfToPpm, or place it at:
-  %LOCALAPPDATA%\opencode-office\poppler\Library\bin\pdftoppm.exe
-"@
+    throw "pdftoppm.exe not found. Install poppler or place under %LOCALAPPDATA%\opencode-office\poppler\..."
 }
 
 if (-not $OutputDir) {
-    $OutputDir = Join-Path $env:TEMP "opencode-office\render"
+    $OutputDir = Join-Path (Get-Location) ".opencode-office\cache\default"
 }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
@@ -103,13 +89,10 @@ New-Item -ItemType Directory -Path $work -Force | Out-Null
 
 $workDocx = Join-Path $work "input.docx"
 $workPdf = Join-Path $work "output.pdf"
-$pngPrefix = Join-Path $OutputDir ("page")
-$expectedPng = Join-Path $OutputDir ("page-$Page.png")
+$pngPrefix = Join-Path $OutputDir "page"
 
 try {
     Copy-Item -LiteralPath $InputDocx -Destination $workDocx -Force
-
-    # Ensure no stale Word locks
     Stop-WordQuiet
 
     Write-Host "Word COM: DOCX -> PDF ..."
@@ -134,39 +117,42 @@ try {
         Stop-WordQuiet
         throw "Word export failed (exit $($proc.ExitCode))"
     }
-
-    # Always clean Word after export
     Stop-WordQuiet
 
     if ($KeepPdf) {
-        $outPdf = Join-Path $OutputDir ([IO.Path]::GetFileNameWithoutExtension((Split-Path $InputDocx -Leaf)) + ".pdf")
+        $outPdf = Join-Path $OutputDir "document.pdf"
         Copy-Item -LiteralPath $workPdf -Destination $outPdf -Force
         Write-Host "PDF: $outPdf"
     }
 
-    Write-Host "pdftoppm: PDF page $Page -> PNG @ ${Dpi}dpi ..."
-    if (Test-Path -LiteralPath $expectedPng) {
-        Remove-Item -LiteralPath $expectedPng -Force
+    # clear old page pngs in this job dir
+    Get-ChildItem -LiteralPath $OutputDir -Filter "page-*.png" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    if ($AllPages) {
+        Write-Host "pdftoppm: all pages -> PNG @ ${Dpi}dpi ..."
+        $pArgs = @("-png", "-r", "$Dpi", $workPdf, $pngPrefix)
+    } else {
+        Write-Host "pdftoppm: page $Page -> PNG @ ${Dpi}dpi ..."
+        $pArgs = @("-png", "-f", "$Page", "-l", "$Page", "-r", "$Dpi", $workPdf, $pngPrefix)
     }
-    $pArgs = @("-png", "-f", "$Page", "-l", "$Page", "-r", "$Dpi", $workPdf, $pngPrefix)
     $p = Start-Process -FilePath $pdftoppm -ArgumentList $pArgs -Wait -PassThru -NoNewWindow
     if ($p.ExitCode -ne 0) {
         throw "pdftoppm failed (exit $($p.ExitCode))"
     }
-    if (-not (Test-Path -LiteralPath $expectedPng)) {
-        # some builds use page-1.png vs page1.png
-        $alt = Get-ChildItem -LiteralPath $OutputDir -Filter "page*.png" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($alt) {
-            $expectedPng = $alt.FullName
-        } else {
-            throw "PNG not produced in $OutputDir"
-        }
+
+    $pngs = @(Get-ChildItem -LiteralPath $OutputDir -Filter "page-*.png" | Sort-Object Name)
+    if ($pngs.Count -eq 0) {
+        throw "PNG not produced in $OutputDir"
     }
 
     Write-Host "OK"
-    Write-Host "PNG=$expectedPng"
-    Write-Host "SIZE=$((Get-Item -LiteralPath $expectedPng).Length)"
-    return $expectedPng
+    Write-Host "DIR=$OutputDir"
+    Write-Host "COUNT=$($pngs.Count)"
+    foreach ($f in $pngs) {
+        Write-Host "PNG=$($f.FullName)"
+    }
+    return ($pngs | ForEach-Object { $_.FullName })
 }
 finally {
     Stop-WordQuiet
