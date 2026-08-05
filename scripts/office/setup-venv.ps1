@@ -7,7 +7,7 @@
 param(
     [string]$Python = "",
     [string]$VenvDir = "",
-    [string[]]$Packages = @("python-docx", "openpyxl", "lxml")
+    [string[]]$Packages = @("python-docx", "openpyxl", "lxml", "pypdf")
 )
 
 $ErrorActionPreference = "Stop"

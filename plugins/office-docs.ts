@@ -235,9 +235,11 @@ export const OfficeDocsPlugin: Plugin = async () => {
           if (!py) {
             lines.push(setupGuide("Not configured yet."))
           } else {
-            const imp = await run(py, ["-c", "import docx, openpyxl, lxml; print('ok')"], {
-              timeoutMs: 20_000,
-            })
+            const imp = await run(
+              py,
+              ["-c", "import docx, openpyxl, lxml, pypdf; print('ok')"],
+              { timeoutMs: 20_000 },
+            )
             lines.push(`Imports:     ${imp.code === 0 ? "ok" : "FAIL " + (imp.stderr || imp.stdout).trim()}`)
             lines.push("")
             lines.push("Golden path: edit (office_docx_*) → office_render all_pages → inspect PNGs → fix → deliver DOCX")
@@ -337,9 +339,11 @@ export const OfficeDocsPlugin: Plugin = async () => {
           const cfg = loadConfig()
           const py = venvPython(cfg)
           if (!py) return setupGuide("No venv python — run office_setup.")
-          const imp = await run(py, ["-c", "import docx, openpyxl, lxml; print('imports-ok')"], {
-            timeoutMs: 30_000,
-          })
+          const imp = await run(
+            py,
+            ["-c", "import docx, openpyxl, lxml, pypdf; print('imports-ok')"],
+            { timeoutMs: 30_000 },
+          )
           const wordOk = await probeWord()
           const next = loadConfig() || {}
           next.wordOk = wordOk
@@ -422,15 +426,16 @@ export const OfficeDocsPlugin: Plugin = async () => {
       office_docx_edit: tool({
         description: [
           "Edit DOCX paragraphs via python-docx.",
-          "action=set_paragraph: set text by paragraph index (from office_docx_info).",
-          "action=add_paragraph: append body or heading.",
+          "action=set_paragraph | add_paragraph | replace_text.",
           "Then office_render all_pages and inspect PNGs (Codex golden path).",
         ].join(" "),
         args: {
           path: tool.schema.string(),
-          action: tool.schema.enum(["set_paragraph", "add_paragraph"]),
+          action: tool.schema.enum(["set_paragraph", "add_paragraph", "replace_text"]),
           index: tool.schema.number().optional().describe("Paragraph index for set_paragraph"),
-          text: tool.schema.string().describe("New text"),
+          text: tool.schema.string().optional().describe("New text (set/add)"),
+          old_text: tool.schema.string().optional().describe("For replace_text"),
+          new_text: tool.schema.string().optional().describe("For replace_text"),
           heading_level: tool.schema
             .number()
             .optional()
@@ -444,25 +449,224 @@ export const OfficeDocsPlugin: Plugin = async () => {
           const path = resolvePath(args.path, ctx.directory)
           if (!existsSync(path)) return `Error: not found: ${path}`
           const out = args.out?.trim() ? resolvePath(args.out, ctx.directory) : ""
+          const nextHint = "\n\nNext: office_render path=... all_pages=true and inspect PNGs."
+
+          if (args.action === "replace_text") {
+            if (!args.old_text) return "Error: old_text required for replace_text"
+            const a = [path, "--old", args.old_text, "--new", args.new_text ?? ""]
+            if (out) a.push("--out", out)
+            const r = await runVenvPython(cfg, "docx_replace.py", a, ctx.directory)
+            const body = (r.stdout || r.stderr).trim()
+            return r.code !== 0 ? body : body + nextHint
+          }
 
           if (args.action === "set_paragraph") {
             if (args.index === undefined || args.index === null) {
               return "Error: index required for set_paragraph (use office_docx_info)."
             }
+            if (args.text === undefined) return "Error: text required"
             const a = [path, "--index", String(Math.floor(args.index)), "--text", args.text]
             if (out) a.push("--out", out)
             const r = await runVenvPython(cfg, "docx_set_paragraph.py", a, ctx.directory)
             const body = (r.stdout || r.stderr).trim()
-            if (r.code !== 0) return body
-            return `${body}\n\nNext: office_render path=... all_pages=true and inspect PNGs.`
+            return r.code !== 0 ? body : body + nextHint
           }
 
+          if (args.text === undefined) return "Error: text required"
           const a = [path, "--text", args.text, "--heading-level", String(args.heading_level ?? 0)]
           if (out) a.push("--out", out)
           const r = await runVenvPython(cfg, "docx_add_paragraph.py", a, ctx.directory)
           const body = (r.stdout || r.stderr).trim()
+          return r.code !== 0 ? body : body + nextHint
+        },
+      }),
+
+      office_docx_table: tool({
+        description:
+          "DOCX tables: action=add | set_cell | to_csv. Use after office_docx_info for table indices.",
+        args: {
+          path: tool.schema.string(),
+          action: tool.schema.enum(["add", "set_cell", "to_csv"]),
+          rows: tool.schema.number().optional(),
+          cols: tool.schema.number().optional(),
+          data: tool.schema.string().optional().describe('JSON 2D array for add'),
+          table_index: tool.schema.number().optional(),
+          row: tool.schema.number().optional(),
+          col: tool.schema.number().optional(),
+          text: tool.schema.string().optional(),
+          csv_out: tool.schema.string().optional(),
+          out: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          if (!existsSync(path)) return `Error: not found: ${path}`
+          const a = [path, "--action", args.action]
+          if (args.rows != null) a.push("--rows", String(args.rows))
+          if (args.cols != null) a.push("--cols", String(args.cols))
+          if (args.data) a.push("--data", args.data)
+          if (args.table_index != null) a.push("--table-index", String(args.table_index))
+          if (args.row != null) a.push("--row", String(args.row))
+          if (args.col != null) a.push("--col", String(args.col))
+          if (args.text != null) a.push("--text", args.text)
+          if (args.csv_out) a.push("--csv-out", resolvePath(args.csv_out, ctx.directory))
+          if (args.out) a.push("--out", resolvePath(args.out, ctx.directory))
+          const r = await runVenvPython(cfg, "docx_table.py", a, ctx.directory)
+          const body = (r.stdout || r.stderr).trim()
           if (r.code !== 0) return body
-          return `${body}\n\nNext: office_render path=... all_pages=true and inspect PNGs.`
+          return body + "\n\nNext: office_render all_pages=true after layout-sensitive table edits."
+        },
+      }),
+
+      office_docx_format: tool({
+        description:
+          "DOCX page setup / header / footer. action=page_setup | header_footer. Then re-render.",
+        args: {
+          path: tool.schema.string(),
+          action: tool.schema.enum(["page_setup", "header_footer"]),
+          top: tool.schema.number().optional().describe("Margin inches"),
+          bottom: tool.schema.number().optional(),
+          left: tool.schema.number().optional(),
+          right: tool.schema.number().optional(),
+          orientation: tool.schema.enum(["portrait", "landscape"]).optional(),
+          header: tool.schema.string().optional(),
+          footer: tool.schema.string().optional(),
+          out: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          if (!existsSync(path)) return `Error: not found: ${path}`
+          const out = args.out ? resolvePath(args.out, ctx.directory) : ""
+          if (args.action === "page_setup") {
+            const a = [path]
+            if (args.top != null) a.push("--top", String(args.top))
+            if (args.bottom != null) a.push("--bottom", String(args.bottom))
+            if (args.left != null) a.push("--left", String(args.left))
+            if (args.right != null) a.push("--right", String(args.right))
+            if (args.orientation) a.push("--orientation", args.orientation)
+            if (out) a.push("--out", out)
+            const r = await runVenvPython(cfg, "docx_page_setup.py", a, ctx.directory)
+            return (r.stdout || r.stderr).trim() + "\n\nNext: office_render all_pages=true"
+          }
+          const a = [path, "--header", args.header ?? "", "--footer", args.footer ?? ""]
+          if (out) a.push("--out", out)
+          const r = await runVenvPython(cfg, "docx_header_footer.py", a, ctx.directory)
+          return (r.stdout || r.stderr).trim() + "\n\nNext: office_render all_pages=true"
+        },
+      }),
+
+      office_docx_merge: tool({
+        description: "Append other DOCX files onto a base DOCX (simple body merge).",
+        args: {
+          base: tool.schema.string(),
+          append: tool.schema
+            .string()
+            .describe('JSON array of docx paths, e.g. ["a.docx","b.docx"]'),
+          out: tool.schema.string(),
+          page_break: tool.schema.boolean().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const base = resolvePath(args.base, ctx.directory)
+          let list: string[] = []
+          try {
+            list = JSON.parse(args.append)
+          } catch {
+            return "Error: append must be JSON array of paths"
+          }
+          const a = [base, "--out", resolvePath(args.out, ctx.directory)]
+          if (args.page_break) a.push("--page-break")
+          for (const p of list) a.push("--append", resolvePath(p, ctx.directory))
+          const r = await runVenvPython(cfg, "docx_merge.py", a, ctx.directory)
+          return (r.stdout || r.stderr).trim()
+        },
+      }),
+
+      office_docx_meta: tool({
+        description: "Get or scrub DOCX core properties (author, etc.). action=get|scrub.",
+        args: {
+          path: tool.schema.string(),
+          action: tool.schema.enum(["get", "scrub"]),
+          out: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          const a = [path, "--action", args.action]
+          if (args.out) a.push("--out", resolvePath(args.out, ctx.directory))
+          const r = await runVenvPython(cfg, "docx_meta.py", a, ctx.directory)
+          return (r.stdout || r.stderr).trim()
+        },
+      }),
+
+      office_docx_comments: tool({
+        description: "List Word comments from OOXML (structural; may not appear in page PNGs).",
+        args: { path: tool.schema.string() },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          const r = await runVenvPython(cfg, "docx_comments.py", [path], ctx.directory)
+          return (r.stdout || r.stderr).trim()
+        },
+      }),
+
+      office_xlsx: tool({
+        description:
+          "Excel XLSX ops: action=info|read|write_cell|create via openpyxl in dedicated venv.",
+        args: {
+          path: tool.schema.string(),
+          action: tool.schema.enum(["info", "read", "write_cell", "create"]),
+          sheet: tool.schema.string().optional(),
+          cell: tool.schema.string().optional().describe("e.g. B2"),
+          value: tool.schema.string().optional().describe("string or JSON-encoded number/bool"),
+          max_rows: tool.schema.number().optional(),
+          max_cols: tool.schema.number().optional(),
+          out: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          const a = [path, "--action", args.action]
+          if (args.sheet) a.push("--sheet", args.sheet)
+          if (args.cell) a.push("--cell", args.cell)
+          if (args.value != null) a.push("--value", args.value)
+          if (args.max_rows != null) a.push("--max-rows", String(args.max_rows))
+          if (args.max_cols != null) a.push("--max-cols", String(args.max_cols))
+          if (args.out) a.push("--out", resolvePath(args.out, ctx.directory))
+          const r = await runVenvPython(cfg, "xlsx_ops.py", a, ctx.directory)
+          return (r.stdout || r.stderr).trim()
+        },
+      }),
+
+      office_pdf_text: tool({
+        description: "Extract text from PDF pages (pypdf). page=0 means all pages.",
+        args: {
+          path: tool.schema.string(),
+          page: tool.schema.number().optional().describe("1-based; 0 or omit for all"),
+          max_chars: tool.schema.number().optional(),
+        },
+        async execute(args, ctx) {
+          const cfg = loadConfig()
+          const missing = requireReady(cfg)
+          if (missing) return missing
+          const path = resolvePath(args.path, ctx.directory)
+          const a = [path, "--page", String(args.page ?? 0)]
+          if (args.max_chars != null) a.push("--max-chars", String(args.max_chars))
+          const r = await runVenvPython(cfg, "pdf_text.py", a, ctx.directory)
+          return (r.stdout || r.stderr).trim()
         },
       }),
 

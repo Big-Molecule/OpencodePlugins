@@ -45,32 +45,22 @@ Then **restart OpenCode**.
 | `image-gen.ts` | `image_*` | OpenAI-compatible image generate/edit |
 | `office-docs.ts` | `office_*` | DOCX edit (venv python-docx) + Word COM page render (Codex-style) |
 
-### office-docs (Codex-style)
+### office-docs (Codex-style local suite)
 
-**Golden path:** edit → `office_render` `all_pages=true` → inspect PNGs → fix → deliver DOCX.
+**Golden path:** edit → `office_render` `all_pages=true` → inspect PNGs → fix → deliver file.
 
 | Tool | Purpose |
 |------|---------|
-| `office_status` | Readiness |
-| `office_setup` | System Python → dedicated venv; probe Word; sync scripts |
-| `office_verify` | Re-check imports + Word COM |
-| `office_docx_info` | Paragraph/table summary |
-| `office_docx_create` | Create simple DOCX |
-| `office_docx_edit` | set/add paragraphs |
-| `office_render` | DOCX → page PNGs via Word COM + pdftoppm |
+| `office_status` / `office_setup` / `office_verify` | Dedicated venv + Word probe |
+| `office_docx_info` / `comments` / `meta` | Inspect structure, comments, properties |
+| `office_docx_create` / `edit` / `table` / `format` / `merge` | Create & edit DOCX |
+| `office_xlsx` | Excel info/read/write/create |
+| `office_pdf_text` | PDF text extract |
+| `office_render` | DOCX → page PNGs (Word COM + pdftoppm) |
 
-**Paths**
+**Paths:** config `~\.config\opencode\office-docs.json`; venv/scripts `%LOCALAPPDATA%\opencode-office\`; job temp `<workdir>/.opencode-office/cache/<jobId>/`.
 
-| What | Where |
-|------|--------|
-| Config | `~\.config\opencode\office-docs.json` |
-| Venv | `%LOCALAPPDATA%\opencode-office\venv` |
-| Scripts | `%LOCALAPPDATA%\opencode-office\scripts` |
-| Job temp | `<workdir>/.opencode-office/cache/<jobId>/` |
-
-**Requires:** Python ≥ 3.10 on machine, Microsoft Word, pdftoppm (poppler; auto-detects Codex cache if present).
-
-Does **not** pollute project venv. No Google Drive / marketplace.
+**Requires:** Python ≥ 3.10, Microsoft Word, pdftoppm. No project-venv pollution. No Google Drive.
 
 ### image-gen
 
