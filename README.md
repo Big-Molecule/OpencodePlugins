@@ -12,7 +12,11 @@ OpenCodePlugins/
 │   ├── everything-search.ts
 │   └── image-gen.ts
 └── scripts/
-    └── install.ps1          # copy *.ts/*.js -> ~/.config/opencode/plugins
+    ├── install.ps1          # copy *.ts/*.js -> ~/.config/opencode/plugins
+    └── office/              # DOCX page preview (Word COM + pdftoppm)
+        ├── render-docx.ps1
+        ├── export-docx-pdf.vbs
+        └── README.md
 ```
 
 OpenCode auto-loads `*.ts` / `*.js` from:
