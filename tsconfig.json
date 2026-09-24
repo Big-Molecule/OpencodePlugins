@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "plugins/lib/**/*.ts",
+    "plugins/everything-search.ts",
+    "plugins/bandizip.ts",
+    "plugins/image-gen.ts",
+    "plugins/lolia-frp.ts",
+    "plugins/office-docs.ts",
+    "plugins/sciencedirect.ts"
+  ]
+}

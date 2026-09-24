@@ -1,4 +1,4 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import { spawn } from "node:child_process"
 import { mkdirSync, createWriteStream } from "node:fs"
 import { access, constants } from "node:fs/promises"
@@ -11,7 +11,7 @@ const DEFAULT_TIMEOUT_MS = 15_000
 const FALLBACK_TIMEOUT_MS = 20_000
 const ES_DIR = path.join(process.env.LOCALAPPDATA ?? process.env.HOME ?? ".", "opencode-everything")
 const ES_MANAGED = path.join(ES_DIR, "es.exe")
-const ES_ZIP_URL = "https://www.voidtools.com/ES-1.1.0.37.zip"
+const ES_VERSION = "1.1.0.38"
 
 const ES_CANDIDATES = [
   process.env.EVERYTHING_ES_PATH,
@@ -109,7 +109,7 @@ async function resolveEs(): Promise<string | null> {
   return null
 }
 
-async function isEverythingRunning(): Promise<boolean> {
+async function isEverythingDetected(): Promise<boolean> {
   if (!isWindows()) return false
 
   const byProcess = await run("tasklist.exe", ["/FI", "IMAGENAME eq Everything.exe", "/NH"], 5000)
@@ -127,6 +127,17 @@ async function isEverythingRunning(): Promise<boolean> {
     if (await fileExists(p)) return true
   }
   return false
+}
+
+function getEsZipUrl(): string | null {
+  const archiveByArch: Record<string, string> = {
+    arm: "ARM",
+    arm64: "ARM64",
+    ia32: "x86",
+    x64: "x64",
+  }
+  const archiveArch = archiveByArch[process.arch]
+  return archiveArch ? `https://www.voidtools.com/ES-${ES_VERSION}.${archiveArch}.zip` : null
 }
 
 function buildEsArgs(input: {
@@ -216,15 +227,20 @@ async function downloadEs(): Promise<{ ok: true; path: string } | { ok: false; m
     return { ok: false, message: "Automatic es install is only supported on Windows." }
   }
 
+  const zipUrl = getEsZipUrl()
+  if (!zipUrl) {
+    return { ok: false, message: `Automatic es install does not support ${process.arch}.` }
+  }
+
   try {
     mkdirSync(ES_DIR, { recursive: true })
     const zipPath = path.join(ES_DIR, "es.zip")
 
-    const response = await fetch(ES_ZIP_URL)
+    const response = await fetch(zipUrl)
     if (!response.ok || !response.body) {
       return {
         ok: false,
-        message: `Failed to download es from ${ES_ZIP_URL} (HTTP ${response.status}). Install manually from https://www.voidtools.com/downloads/`,
+        message: `Failed to download es from ${zipUrl} (HTTP ${response.status}). Install manually from https://www.voidtools.com/downloads/`,
       }
     }
 
@@ -297,13 +313,26 @@ async function downloadEs(): Promise<{ ok: true; path: string } | { ok: false; m
   }
 }
 
-export const EverythingSearchPlugin: Plugin = async () => {
+export const EverythingSearchPlugin: ToolFactory = async () => {
   return {
+    system: async (output) => {
+      if (!isWindows()) return
+      output.system.push([
+        "Windows program discovery: when a required command is not on PATH, or an installed program's location is unknown, use everything_search to locate it across indexed drives before guessing common installation directories or proposing/downloading/installing another copy.",
+        "A failed Get-Command/where lookup means the command is not on PATH; it does not establish that the program is not installed.",
+        "Search first for the executable name (for example ffmpeg.exe, pdftoppm.exe, or inkscape.exe) with files_only=true and omit path for cross-drive discovery. If necessary, try the product name or a filename wildcard.",
+        "Inspect candidate paths and verify the intended executable/version using a documented non-interactive check before invoking it by absolute path. Search hits may be installers, backups, or unrelated files.",
+        "If Everything reports IPC failure or an incomplete fallback, do not treat that as proof of absence; resolve the search failure or use another local discovery method before concluding the program is missing.",
+        "Use project Glob/Grep for ordinary project files. Honor explicit requests for a fresh installation or a specific version.",
+      ].join(" "))
+    },
     tool: {
       everything_search: tool({
         description: [
-          "GLOBAL filesystem search via Everything (Windows). Use ONLY when you need large-scope / cross-drive / whole-machine filename lookup,",
-          "or when resolving a file name/path that is outside the current project.",
+          "PREFERRED Windows tool for locating installed programs/executables that are missing from PATH or whose installation path is unknown.",
+          "After Get-Command/where fails, use this BEFORE guessing common install paths or proposing/downloading/installing another copy. Not on PATH does not mean not installed.",
+          "Search the executable filename with files_only=true and omit path to search across indexed drives; broaden to a product name or wildcard if needed. Verify candidate identity/version before use.",
+          "Also use for global, cross-drive filename lookup and locating files outside the current project.",
           "Do NOT use for ordinary in-project search — prefer built-in Glob/Grep/Bash there.",
           "Supports Everything query syntax (ext:ts;tsx, *.pdf, folder:src).",
           "If Everything is missing, falls back to slow OS search and explains that.",
@@ -313,12 +342,12 @@ export const EverythingSearchPlugin: Plugin = async () => {
           query: tool.schema
             .string()
             .describe(
-              'Search query / filename. Examples: "notes.md", "ext:pdf report", "*.tsx", "package.json"',
+              'Search query / filename. For installed programs: "ffmpeg.exe", "pdftoppm.exe", "inkscape*.exe" (use files_only=true, omit path). Other examples: "notes.md", "ext:pdf report", "*.tsx".',
             ),
           path: tool.schema
             .string()
             .optional()
-            .describe("Optional root path limit (Everything -path). For fallback search this is the recurse root."),
+            .describe("Optional root path limit (Everything -path). OMIT when locating a program with an unknown install location to search across indexed drives. For fallback search this is the recurse root."),
           limit: tool.schema
             .number()
             .optional()
@@ -359,12 +388,14 @@ export const EverythingSearchPlugin: Plugin = async () => {
             ].join("\n")
           }
 
-          const everythingOk = await isEverythingRunning()
+          // Detection only confirms an installation, service, or process. A successful es query
+          // below is the authoritative check that the user-session search client exposes IPC.
+          const everythingDetected = await isEverythingDetected()
           let esPath = await resolveEs()
 
           // User agreed to install es
           if (!esPath && args.install_es) {
-            if (!everythingOk) {
+            if (!everythingDetected) {
               return [
                 "Cannot install only es usefully: Everything itself is not detected.",
                 "Install Everything first from https://www.voidtools.com/",
@@ -387,7 +418,7 @@ export const EverythingSearchPlugin: Plugin = async () => {
           }
 
           // Everything missing → fallback
-          if (!everythingOk && !esPath) {
+          if (!everythingDetected && !esPath) {
             return [
               "Everything is not installed (or not running).",
               "For whole-disk instant search, install Everything: https://www.voidtools.com/",
@@ -398,7 +429,7 @@ export const EverythingSearchPlugin: Plugin = async () => {
           }
 
           // Everything present but es missing → ask (do not install without consent)
-          if (everythingOk && !esPath) {
+          if (everythingDetected && !esPath) {
             return [
               "Everything appears installed/running, but the CLI (es.exe) was not found.",
               "",
@@ -418,7 +449,7 @@ export const EverythingSearchPlugin: Plugin = async () => {
             ].join("\n")
           }
 
-          // es found but Everything may not be running — still try; es often needs Everything service
+          // es found but Everything may not be running - still try because the query is authoritative.
           if (!esPath) {
             return [
               "es.exe not found.",
@@ -443,25 +474,43 @@ export const EverythingSearchPlugin: Plugin = async () => {
           if (result.error) {
             return [
               `Failed to run es at "${esPath}": ${result.error}`,
-              everythingOk
-                ? "Ensure Everything is running and its index is ready."
-                : "Everything may not be running. Start Everything, then retry.",
+              everythingDetected
+                ? "Ensure the Everything search client is running in this Windows user session."
+                : "Everything may not be installed. Install or start Everything, then retry.",
               "",
               await fallbackSearch(query, root, limit),
             ].join("\n")
           }
 
-          const lines = parseLines(result.stdout)
-          if (lines.length === 0) {
+          if (result.code === 7 || result.code === 8) {
             const detail = result.stderr.trim()
+            const summary =
+              result.code === 8
+                ? "Everything IPC is unavailable (es exit 8)."
+                : "The Everything IPC query failed (es exit 7)."
             return [
-              `No results via Everything (es).`,
-              detail ? `stderr: ${detail}` : "",
-              result.code ? `exit: ${result.code}` : "",
-              "Tip: if this is unexpected, confirm Everything finished indexing.",
+              summary,
+              ...(detail ? [detail] : []),
+              "Start the Everything search client in the same signed-in Windows session as OpenCode, then retry.",
+              "The Windows Everything service only helps the client index NTFS volumes; it does not provide the search IPC used by es.exe.",
+              "If both programs are open, ensure they run at the same privilege level and use the same Everything instance.",
+              "",
+              await fallbackSearch(query, root, limit),
+            ].join("\n")
+          }
+
+          if (result.code !== 0) {
+            return [
+              `Everything CLI failed with exit ${result.code ?? "unknown"}.`,
+              result.stderr.trim(),
             ]
               .filter(Boolean)
               .join("\n")
+          }
+
+          const lines = parseLines(result.stdout)
+          if (lines.length === 0) {
+            return "No results via Everything (es)."
           }
 
           return formatResults(`Everything search via ${esPath}`, lines, limit)
@@ -470,3 +519,5 @@ export const EverythingSearchPlugin: Plugin = async () => {
     },
   }
 }
+
+export default defineToolsPlugin("everything-search", EverythingSearchPlugin)

@@ -1,4 +1,4 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import {
   chmodSync,
   existsSync,
@@ -219,7 +219,7 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
     firstDefined(env[API_ENV.host], stored.host, stored.domain, DEFAULT_API.host),
     { required: false },
   )
-  const port = normalizePort(firstDefined(env[API_ENV.port], stored.port, DEFAULT_API.port))
+  const port = normalizePort(firstDefined<string | number>(env[API_ENV.port], stored.port, DEFAULT_API.port))
   const path = normalizePath(firstDefined(env[API_ENV.path], stored.path, DEFAULT_API.path))
   const modelsPath = normalizePath(
     firstDefined(env[API_ENV.modelsPath], stored.modelsPath, DEFAULT_API.modelsPath),
@@ -275,13 +275,125 @@ function apiForStorage(api: ResolvedApi) {
     port: api.port,
     path: api.path,
     modelsPath: api.modelsPath,
-    key: api.key,
+    key: api.key || undefined,
     model: api.model || undefined,
   }
 }
 
 function resolveSize(quality: string, ratio: string) {
   return SIZE_MATRIX[quality.toUpperCase()]?.[ratio.toLowerCase()] || null
+}
+
+type ImagePayload = {
+  base64: string
+  mimeType: string | null
+}
+
+type SourceImage = {
+  base64: string
+  mimeType: string
+}
+
+type ImageRequestResult =
+  | { ok: true; images: ImagePayload[]; route: string; warning?: string }
+  | { ok: false; error: string }
+
+export function resolveImageProtocolEndpoints(endpoint: string) {
+  const imageUrl = new URL(endpoint)
+  imageUrl.search = ""
+  imageUrl.hash = ""
+
+  const responsesUrl = new URL(imageUrl)
+  const responsesMatch = responsesUrl.pathname.match(/^(.*)\/v1\/images\/generations\/?$/i)
+  responsesUrl.pathname = responsesMatch
+    ? `${responsesMatch[1]}/v1/responses`
+    : "/v1/responses"
+
+  return {
+    images: imageUrl.toString(),
+    responses: responsesUrl.toString(),
+  }
+}
+
+export function buildResponsesImageRequest(
+  model: string,
+  prompt: string,
+  image?: SourceImage,
+) {
+  if (!image) return { model, input: prompt }
+  return {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          {
+            type: "input_image",
+            image_url: `data:${image.mimeType};base64,${image.base64}`,
+          },
+        ],
+      },
+    ],
+  }
+}
+
+export function extractImagePayloads(payload: unknown) {
+  const images: ImagePayload[] = []
+  const seen = new Set<string>()
+  const dataUriPattern = /data:(image\/[a-z0-9.+-]+)(?:;[^,;]+)*;base64,([a-z0-9+/_=\r\n-]+)/gi
+
+  const add = (base64: unknown, mimeType: unknown = null) => {
+    if (typeof base64 !== "string") return
+    const normalized = base64.replace(/\s/g, "")
+    if (!normalized) return
+    const buffer = Buffer.from(normalized, "base64")
+    if (!detectImageExtension(buffer)) return
+    const mime = typeof mimeType === "string" && mimeType ? mimeType.toLowerCase() : null
+    const fingerprint = `${normalized.length}:${normalized.slice(0, 64)}:${normalized.slice(-32)}`
+    if (seen.has(fingerprint)) return
+    seen.add(fingerprint)
+    images.push({ base64: normalized, mimeType: mime })
+  }
+
+  const addDataUris = (text: string) => {
+    dataUriPattern.lastIndex = 0
+    for (let match = dataUriPattern.exec(text); match; match = dataUriPattern.exec(text)) {
+      add(match[2], match[1])
+    }
+  }
+
+  const visitOutput = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visitOutput(item)
+      return
+    }
+    if (!value || typeof value !== "object") return
+
+    const obj = value as Record<string, unknown>
+    add(obj.b64_json, obj.mime_type ?? obj.mimeType)
+
+    if (obj.type === "image_generation_call" && typeof obj.result === "string") {
+      if (obj.result.startsWith("data:image/")) addDataUris(obj.result)
+      else add(obj.result, obj.mime_type ?? obj.mimeType ?? "image/png")
+    }
+
+    for (const key of ["text", "output_text", "image_url", "url"]) {
+      if (typeof obj[key] === "string") addDataUris(obj[key] as string)
+    }
+    if (Array.isArray(obj.content)) visitOutput(obj.content)
+  }
+
+  if (Array.isArray(payload)) {
+    visitOutput(payload)
+    return images
+  }
+  if (!payload || typeof payload !== "object") return images
+  const root = payload as Record<string, unknown>
+  if (Array.isArray(root.data)) visitOutput(root.data)
+  if (Array.isArray(root.output)) visitOutput(root.output)
+  if (typeof root.output_text === "string") addDataUris(root.output_text)
+  return images
 }
 
 function resolveOutputDir(userDir?: string) {
@@ -659,6 +771,262 @@ function formatVerifyResult(result: VerifyResult) {
   return lines.join("\n")
 }
 
+async function postImageRequest(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  route: string,
+  timeoutMs: number,
+): Promise<ImageRequestResult> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      const responseBody = await response.text()
+      let json: unknown
+      try {
+        json = JSON.parse(responseBody)
+      } catch {
+        json = undefined
+      }
+      return {
+        ok: false,
+        error: `HTTP ${response.status}: ${extractErrorMessage(responseBody, json)}`,
+      }
+    }
+
+    let payload: unknown
+    try {
+      payload = await response.json()
+    } catch {
+      return { ok: false, error: "Response was not valid JSON." }
+    }
+    const images = extractImagePayloads(payload)
+    if (images.length === 0) return { ok: false, error: "No image data in response." }
+    return { ok: true, images, route }
+  } catch (err: any) {
+    return {
+      ok: false,
+      error:
+        err?.name === "AbortError"
+          ? `Timeout (${timeoutMs / 1000}s)`
+          : String(err?.message || err),
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function requestResponsesImage(
+  api: ResolvedApi,
+  prompt: string,
+  image: SourceImage | undefined,
+  timeoutMs: number,
+): Promise<ImageRequestResult> {
+  const endpoints = resolveImageProtocolEndpoints(api.endpoint!)
+  return postImageRequest(
+    endpoints.responses,
+    {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${api.key}`,
+    },
+    buildResponsesImageRequest(api.model!, prompt, image),
+    "responses-fallback",
+    timeoutMs,
+  )
+}
+
+export async function requestImagePayloads(
+  api: ResolvedApi,
+  prompt: string,
+  size: string,
+  image?: SourceImage,
+  count = 1,
+  timeoutMs = 220_000,
+): Promise<ImageRequestResult> {
+  if (!api.endpoint || !api.model || !api.key) {
+    return { ok: false, error: "API host, model, and key are required." }
+  }
+
+  const dataUrl = image ? `data:${image.mimeType};base64,${image.base64}` : undefined
+  const imagesApi = await postImageRequest(
+    api.endpoint,
+    {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${api.key}`,
+    },
+    {
+      model: api.model,
+      prompt,
+      n: count,
+      size,
+      ...(dataUrl ? { image: dataUrl } : {}),
+    },
+    "images-api",
+    timeoutMs,
+  )
+  if (imagesApi.ok) return imagesApi
+
+  if (count <= 1) {
+    const responses = await requestResponsesImage(api, prompt, image, timeoutMs)
+    if (responses.ok) return responses
+    return {
+      ok: false,
+      error: `Images API failed (${imagesApi.error}); Responses fallback failed (${responses.error})`,
+    }
+  }
+
+  const attempts = await mapPool(
+    Array.from({ length: count }),
+    Math.min(count, 3),
+    () => requestResponsesImage(api, prompt, image, timeoutMs),
+  )
+  const images: ImagePayload[] = []
+  const routes = new Set<string>()
+  const errors: string[] = []
+  for (const attempt of attempts) {
+    if (attempt.ok) {
+      images.push(attempt.images[0])
+      routes.add(attempt.route)
+    } else {
+      errors.push(attempt.error)
+    }
+  }
+  if (images.length === 0) {
+    return {
+      ok: false,
+      error: `Images API failed (${imagesApi.error}); Responses fallback failed (${errors[0] || "No image data in response."})`,
+    }
+  }
+  return {
+    ok: true,
+    images,
+    route: [...routes].join(" + "),
+    ...(errors.length ? { warning: `${errors.length}/${count} image requests failed.` } : {}),
+  }
+}
+
+function detectImageExtension(buffer: Buffer) {
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff &&
+    buffer[buffer.length - 2] === 0xff &&
+    buffer[buffer.length - 1] === 0xd9
+  ) {
+    return "jpg"
+  }
+  if (
+    buffer.length >= 16 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "webp"
+  }
+  if (
+    buffer.length >= 10 &&
+    (buffer.toString("ascii", 0, 6) === "GIF87a" || buffer.toString("ascii", 0, 6) === "GIF89a")
+  ) {
+    return "gif"
+  }
+  if (
+    buffer.length >= 24 &&
+    buffer[0] === 0x89 &&
+    buffer.toString("ascii", 1, 4) === "PNG" &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "png"
+  }
+  return null
+}
+
+function extensionForImage(buffer: Buffer, mimeType: string | null) {
+  const detected = detectImageExtension(buffer)
+  if (detected) return detected
+  const mime = (mimeType || "").split(";", 1)[0].toLowerCase()
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg"
+  if (mime === "image/webp") return "webp"
+  if (mime === "image/gif") return "gif"
+  return "png"
+}
+
+function imageDimensions(buffer: Buffer, extension: string) {
+  if (extension === "png" && buffer.length >= 24) {
+    return `${buffer.readUInt32BE(16)}x${buffer.readUInt32BE(20)}`
+  }
+  if (extension === "gif" && buffer.length >= 10) {
+    return `${buffer.readUInt16LE(6)}x${buffer.readUInt16LE(8)}`
+  }
+  if (extension === "webp" && buffer.length >= 30) {
+    const kind = buffer.toString("ascii", 12, 16)
+    if (kind === "VP8X") {
+      const width = 1 + buffer.readUIntLE(24, 3)
+      const height = 1 + buffer.readUIntLE(27, 3)
+      return `${width}x${height}`
+    }
+    if (kind === "VP8 ") {
+      const width = buffer.readUInt16LE(26) & 0x3fff
+      const height = buffer.readUInt16LE(28) & 0x3fff
+      return `${width}x${height}`
+    }
+    if (kind === "VP8L" && buffer[20] === 0x2f) {
+      const bits = buffer.readUInt32LE(21)
+      const width = (bits & 0x3fff) + 1
+      const height = ((bits >>> 14) & 0x3fff) + 1
+      return `${width}x${height}`
+    }
+  }
+  if (extension === "jpg") {
+    const startOfFrame = new Set([
+      0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+    ])
+    let offset = 2
+    while (offset + 8 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset++
+        continue
+      }
+      const marker = buffer[offset + 1]
+      if (startOfFrame.has(marker)) {
+        return `${buffer.readUInt16BE(offset + 7)}x${buffer.readUInt16BE(offset + 5)}`
+      }
+      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+        offset += 2
+        continue
+      }
+      if (offset + 3 >= buffer.length) break
+      const segmentLength = buffer.readUInt16BE(offset + 2)
+      if (segmentLength < 2) break
+      offset += segmentLength + 2
+    }
+  }
+  return "unknown"
+}
+
+function saveImagePayload(payload: ImagePayload, outputDir: string, prefix: string) {
+  const buffer = Buffer.from(payload.base64, "base64")
+  if (buffer.length === 0) throw new Error("Decoded image data was empty.")
+  const extension = extensionForImage(buffer, payload.mimeType)
+  const filename = `${prefix}_${Math.random().toString(36).slice(2, 6)}.${extension}`
+  const path = join(outputDir, filename)
+  writeFileSync(path, buffer)
+  return {
+    path,
+    fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB`,
+    dimensions: imageDimensions(buffer, extension),
+  }
+}
+
 async function generateOne(
   api: ResolvedApi,
   prompt: string,
@@ -666,54 +1034,15 @@ async function generateOne(
   outputDir: string,
   timeoutMs = 220_000,
 ) {
-  if (!api.endpoint || !api.model || !api.key) {
-    return { ok: false as const, elapsed: 0, error: "API host, model, and key are required." }
-  }
   const start = Date.now()
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const requested = await requestImagePayloads(api, prompt, size, undefined, 1, timeoutMs)
+  const elapsed = Date.now() - start
+  if (!requested.ok) return { ok: false as const, elapsed, error: requested.error }
   try {
-    const res = await fetch(api.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${api.key}`,
-      },
-      body: JSON.stringify({ model: api.model, prompt, n: 1, size }),
-      signal: controller.signal,
-    })
-    clearTimeout(timer)
-    const elapsed = Date.now() - start
-    if (!res.ok) {
-      const body = await res.text()
-      let msg = body
-      try {
-        msg = JSON.parse(body).error?.message || body
-      } catch {
-        /* keep */
-      }
-      return { ok: false as const, elapsed, error: `HTTP ${res.status}: ${msg}` }
-    }
-    const data = (await res.json()) as { data?: Array<{ b64_json?: string }> }
-    const b64 = data.data?.[0]?.b64_json
-    if (!b64) return { ok: false as const, elapsed, error: "No image data in response" }
-    const buf = Buffer.from(b64, "base64")
-    const filename = `img_${timestamp()}_${Math.random().toString(36).slice(2, 6)}.png`
-    const filepath = join(outputDir, filename)
-    writeFileSync(filepath, buf)
-    return {
-      ok: true as const,
-      elapsed,
-      path: filepath,
-      fileSize: `${(buf.length / 1024 / 1024).toFixed(2)}MB`,
-    }
+    const saved = saveImagePayload(requested.images[0], outputDir, `img_${timestamp()}`)
+    return { ok: true as const, elapsed, ...saved, route: requested.route }
   } catch (err: any) {
-    clearTimeout(timer)
-    return {
-      ok: false as const,
-      elapsed: Date.now() - start,
-      error: err?.name === "AbortError" ? `Timeout (${timeoutMs / 1000}s)` : String(err?.message || err),
-    }
+    return { ok: false as const, elapsed, error: String(err?.message || err) }
   }
 }
 
@@ -726,72 +1055,39 @@ async function editOne(
   count = 1,
   timeoutMs = 250_000,
 ) {
-  if (!api.endpoint || !api.model || !api.key) {
-    return {
-      ok: false as const,
-      elapsed: 0,
-      error: "API host, model, and key are required.",
-      sourceName: basename(imagePath),
-    }
-  }
+  const sourceName = basename(imagePath)
   if (!existsSync(imagePath)) {
-    return { ok: false as const, elapsed: 0, error: `File not found: ${imagePath}`, sourceName: basename(imagePath) }
+    return { ok: false as const, elapsed: 0, error: `File not found: ${imagePath}`, sourceName }
   }
   const imageData = readFileSync(imagePath)
-  const lp = imagePath.toLowerCase()
-  const ext =
-    lp.endsWith(".jpg") || lp.endsWith(".jpeg") ? "jpeg" : lp.endsWith(".webp") ? "webp" : "png"
-  const dataUrl = `data:image/${ext};base64,${imageData.toString("base64")}`
-  const sourceName = basename(imagePath)
+  const lowerPath = imagePath.toLowerCase()
+  const mimeType =
+    lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")
+      ? "image/jpeg"
+      : lowerPath.endsWith(".webp")
+        ? "image/webp"
+        : "image/png"
+  const sourceImage = { base64: imageData.toString("base64"), mimeType }
   const start = Date.now()
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const requested = await requestImagePayloads(api, prompt, size, sourceImage, count, timeoutMs)
+  const elapsed = Date.now() - start
+  if (!requested.ok) return { ok: false as const, elapsed, error: requested.error, sourceName }
+
   try {
-    const res = await fetch(api.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${api.key}`,
-      },
-      body: JSON.stringify({ model: api.model, prompt, n: count, size, image: dataUrl }),
-      signal: controller.signal,
-    })
-    clearTimeout(timer)
-    const elapsed = Date.now() - start
-    if (!res.ok) {
-      const body = await res.text()
-      let msg = body
-      try {
-        msg = JSON.parse(body).error?.message || body
-      } catch {
-        /* keep */
-      }
-      return { ok: false as const, elapsed, error: `HTTP ${res.status}: ${msg}`, sourceName }
-    }
-    const data = (await res.json()) as { data?: Array<{ b64_json?: string }> }
-    const results: Array<{ path: string; fileSize: string }> = []
     const ts = timestamp()
-    for (let i = 0; i < (data.data?.length || 0); i++) {
-      const b64 = data.data?.[i]?.b64_json
-      if (!b64) continue
-      const buf = Buffer.from(b64, "base64")
-      const filename = `edit_${ts}_${i + 1}_${Math.random().toString(36).slice(2, 6)}.png`
-      const filepath = join(outputDir, filename)
-      writeFileSync(filepath, buf)
-      results.push({ path: filepath, fileSize: `${(buf.length / 1024 / 1024).toFixed(2)}MB` })
-    }
-    if (results.length === 0) {
-      return { ok: false as const, elapsed, error: "No image data in response", sourceName }
-    }
-    return { ok: true as const, elapsed, results, sourceName }
-  } catch (err: any) {
-    clearTimeout(timer)
+    const results = requested.images.map((payload, index) =>
+      saveImagePayload(payload, outputDir, `edit_${ts}_${index + 1}`),
+    )
     return {
-      ok: false as const,
-      elapsed: Date.now() - start,
-      error: err?.name === "AbortError" ? `Timeout (${timeoutMs / 1000}s)` : String(err?.message || err),
+      ok: true as const,
+      elapsed,
+      results,
       sourceName,
+      route: requested.route,
+      warning: requested.warning,
     }
+  } catch (err: any) {
+    return { ok: false as const, elapsed, error: String(err?.message || err), sourceName }
   }
 }
 
@@ -895,7 +1191,7 @@ function requireReady(api: ResolvedApi) {
   return null
 }
 
-export const ImageGenPlugin: Plugin = async () => {
+export const ImageGenPlugin: ToolFactory = async () => {
   return {
     tool: {
       image_status: tool({
@@ -1192,7 +1488,8 @@ export const ImageGenPlugin: Plugin = async () => {
 
       image_generate: tool({
         description: [
-          "Generate image(s) via the configured OpenAI-compatible image API (b64_json response).",
+          "Generate image(s) via the configured image API.",
+          "All models use Images API first, then Responses API if it fails.",
           "Use when the user wants to create/draw images with Image Gen.",
           "Requires host+key+model. If model missing, run image_list_models and set_model first.",
           "quality: 1K|2K|4K; ratio: square|landscape|portrait; count 1-4 variations of the same prompt.",
@@ -1256,10 +1553,12 @@ export const ImageGenPlugin: Plugin = async () => {
                   "Image generated.",
                   `Prompt:  ${prompts[0]}`,
                   `Model:   ${api.model}`,
-                  `Size:    ${size} (${quality}/${ratio})`,
+                  `Route:   ${result.route}`,
+                  `Request: ${size} (${quality}/${ratio})`,
+                  `Actual:  ${result.dimensions}`,
                   `Time:    ${(result.elapsed / 1000).toFixed(1)}s`,
                   `File:    ${result.path}`,
-                  `Bytes:   ${result.fileSize}`,
+                  `File size: ${result.fileSize}`,
                 ].join("\n")
               }
               prompts = Array(count).fill(prompts[0])
@@ -1275,12 +1574,14 @@ export const ImageGenPlugin: Plugin = async () => {
             const fail = results.filter((r) => !r.ok)
             const lines = [
               `Batch generation finished: ${ok.length}/${results.length} ok in ${(totalTime / 1000).toFixed(1)}s`,
-              `Model: ${api.model}  Size: ${size}  Dir: ${outputDir}`,
+              `Model: ${api.model}  Requested: ${size}  Dir: ${outputDir}`,
               "",
             ]
             results.forEach((r, i) => {
               if (r.ok) {
-                lines.push(`[${i + 1}] ok  ${(r.elapsed / 1000).toFixed(1)}s  ${r.fileSize}`)
+                lines.push(
+                  `[${i + 1}] ok  ${(r.elapsed / 1000).toFixed(1)}s  ${r.dimensions}  ${r.fileSize}  ${r.route}`,
+                )
                 lines.push(`    ${r.path}`)
                 lines.push(`    prompt: ${r.prompt}`)
               } else {
@@ -1298,7 +1599,8 @@ export const ImageGenPlugin: Plugin = async () => {
 
       image_edit: tool({
         description: [
-          "Edit an existing image with the configured image API (sends image as data URL + prompt).",
+          "Edit an existing image with the configured image API.",
+          "All models use Images API first, then Responses API if it fails.",
           "Use when the user wants to modify a local image (background change, add/remove objects, style transfer).",
           "image_path must be a readable local file (png/jpg/webp).",
         ].join(" "),
@@ -1335,12 +1637,16 @@ export const ImageGenPlugin: Plugin = async () => {
               `Source:  ${result.sourceName}`,
               `Prompt:  ${args.prompt.trim()}`,
               `Model:   ${api.model}`,
-              `Size:    ${size}`,
+              `Route:   ${result.route}`,
+              `Request: ${size}`,
               `Time:    ${(result.elapsed / 1000).toFixed(1)}s`,
               `Output:  ${outputDir}`,
               "",
-              ...result.results.map((r, i) => `${i + 1}. ${r.path}  (${r.fileSize})`),
+              ...result.results.map(
+                (r, i) => `${i + 1}. ${r.path}  (${r.dimensions}, ${r.fileSize})`,
+              ),
             ]
+            if (result.warning) lines.push("", `Warning: ${result.warning}`)
             return lines.join("\n")
           } catch (err: any) {
             return `Error: ${err?.message || err}`
@@ -1350,3 +1656,5 @@ export const ImageGenPlugin: Plugin = async () => {
     },
   }
 }
+
+export default defineToolsPlugin("image-gen", ImageGenPlugin)

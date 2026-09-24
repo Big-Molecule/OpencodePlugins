@@ -17,6 +17,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Src = Join-Path $RepoRoot "plugins"
 $ConfigDir = Join-Path $env:USERPROFILE ".config\opencode"
 $Dst = Join-Path $ConfigDir "plugins"
+$V2Plugins = @("bandizip.ts", "everything-search.ts", "image-gen.ts", "lolia-frp.ts", "office-docs.ts", "sciencedirect.ts")
 
 if (-not (Test-Path -LiteralPath $Src)) {
     throw "Plugins directory not found: $Src"
@@ -46,12 +47,25 @@ $files = if ($Plugin) {
     }
     @(Get-Item -LiteralPath $path)
 } else {
-    @(Get-ChildItem -LiteralPath $Src -File | Where-Object { $_.Extension -in ".ts", ".js", ".mjs", ".cjs" })
+    @($V2Plugins | ForEach-Object { Get-Item -LiteralPath (Join-Path $Src $_) })
 }
 
 if ($files.Count -eq 0) {
     Write-Host "No plugin files to install under $Src"
     exit 0
+}
+
+# V2 helpers live below lib/ so they are not discovered as plugin entrypoints.
+if (@($files | Where-Object { $_.Name -in $V2Plugins }).Count -gt 0) {
+    if ($PSCmdlet.ShouldProcess($ConfigDir, "Install V2 plugin dependencies")) {
+        $package = Get-Content -LiteralPath (Join-Path $RepoRoot "package.json") -Raw | ConvertFrom-Json
+        & npm install --prefix $ConfigDir --save-exact "@opencode/plugin@$($package.dependencies.'@opencode/plugin')" "zod@$($package.dependencies.zod)"
+        if ($LASTEXITCODE -ne 0) { throw "Failed to install plugin dependencies" }
+    }
+    if ($PSCmdlet.ShouldProcess((Join-Path $Dst "lib"), "Copy V2 tool helpers")) {
+        New-Item -ItemType Directory -Path (Join-Path $Dst "lib") -Force | Out-Null
+        Copy-Item -Path (Join-Path $Src "lib\*") -Destination (Join-Path $Dst "lib") -Recurse -Force
+    }
 }
 
 foreach ($file in $files) {

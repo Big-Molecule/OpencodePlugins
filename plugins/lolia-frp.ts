@@ -1,4 +1,4 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import { spawn } from "node:child_process"
 import { access, constants, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
@@ -307,7 +307,7 @@ function tunnelLine(t: Tunnel, proc?: FrpcProc) {
   return `#${t.id} [${t.remark || t.name}] ${t.type}  node=${t.node_name ?? t.node_id}  ${local} -> ${target}${tls}  server=${t.status}  ${runPart}`
 }
 
-export const LoliaFrpPlugin: Plugin = async () => {
+export const LoliaFrpPlugin: ToolFactory = async () => {
   return {
     tool: {
       lolia_setup: tool({
@@ -765,4 +765,4 @@ export const LoliaFrpPlugin: Plugin = async () => {
   }
 }
 
-export default LoliaFrpPlugin
+export default defineToolsPlugin("lolia-frp", LoliaFrpPlugin)

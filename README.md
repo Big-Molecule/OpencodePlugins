@@ -32,7 +32,17 @@ cd E:\Projects\Current\OpenCodePlugins
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Then **restart OpenCode**.
+The default install targets **OpenCode V2 (2.0.15+)** and copies these six migrated plugins:
+`bandizip`, `everything-search`, `image-gen`, `lolia-frp`, `office-docs`, and `sciencedirect`.
+It installs the pinned `@opencode/plugin` and Zod dependencies under the OpenCode config directory,
+and copies `plugins/lib/` alongside the entrypoints. Node.js/npm must be available.
+
+`aijavis-sse-filter`, `latex-normalize`, and `local-markdown-images` are excluded from the default
+install; their existing files are left alone. Their V1 implementations are not V2-compatible.
+
+Then **restart OpenCode**, or reload the project's configuration through V2.
+
+Development checks: `npm ci`, `npm run typecheck`, and `npm test`.
 
 `install.ps1` also syncs:
 

@@ -1,4 +1,4 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import { spawn } from "node:child_process"
 import { access, constants, stat } from "node:fs/promises"
 import path from "node:path"
@@ -343,7 +343,7 @@ function redactArgs(args: string[]) {
   return args.map((a) => (a.startsWith("-p:") ? "-p:***" : a))
 }
 
-export const BandizipPlugin: Plugin = async () => {
+export const BandizipPlugin: ToolFactory = async () => {
   return {
     tool: {
       bandizip: tool({
@@ -614,24 +614,7 @@ export const BandizipPlugin: Plugin = async () => {
               return `Error: source path(s) not found:\n${missing.map((m) => `  - ${m}`).join("\n")}`
             }
           }
-          if (
-            (action === "extract" ||
-              action === "test" ||
-              action === "delete" ||
-              action === "add" ||
-              action === "open") &&
-            archive
-          ) {
-            if (action !== "compress" && action !== "add") {
-              // extract/test/delete/open need existing archive; add may create
-              if (action !== "add" && (await pathInfo(archive)) === "missing") {
-                return `Error: archive not found: ${archive}`
-              }
-            }
-          }
-          if (action === "add" && archive && (await pathInfo(archive)) === "missing") {
-            // Bandizip `a` on missing archive often creates it; allow
-          }
+          // extract/test/delete/open need an existing archive; add may create one.
           if (
             (action === "extract" || action === "test" || action === "delete" || action === "open") &&
             archive &&
@@ -673,4 +656,4 @@ export const BandizipPlugin: Plugin = async () => {
   }
 }
 
-export default BandizipPlugin
+export default defineToolsPlugin("bandizip", BandizipPlugin)

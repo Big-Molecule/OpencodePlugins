@@ -18,8 +18,9 @@ Git-managed personal plugins for [OpenCode](https://opencode.ai).
 
 ## Conventions
 
-- Export a `Plugin` function (`export const X: Plugin` or `export default`).
-- Use `@opencode-ai/plugin` (`tool`, `Plugin` types).
+- Migrated plugins default-export an OpenCode V2 definition with a stable `id` and `setup`.
+- Use `@opencode/plugin`; shared schema/registration helpers live in `plugins/lib/tools.ts`.
+- `aijavis-sse-filter`, `latex-normalize`, and `local-markdown-images` remain legacy and are excluded from default installation.
 - No secrets in the repo.
 - Tool descriptions should tell the model when **not** to use the tool (e.g. prefer built-in project search).
 - Keep unfinished plugins in the repo only until they are ready to install.

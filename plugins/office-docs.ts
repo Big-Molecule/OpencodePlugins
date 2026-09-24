@@ -7,7 +7,7 @@
  * Job cache: <workdir>/.opencode-office/cache/<jobId>/
  */
 
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import { spawn } from "node:child_process"
 import {
   existsSync,
@@ -205,7 +205,7 @@ WScript.Quit 0
   return r.code === 0
 }
 
-export const OfficeDocsPlugin: Plugin = async () => {
+export const OfficeDocsPlugin: ToolFactory = async () => {
   return {
     tool: {
       office_status: tool({
@@ -762,3 +762,5 @@ export const OfficeDocsPlugin: Plugin = async () => {
     },
   }
 }
+
+export default defineToolsPlugin("office-docs", OfficeDocsPlugin)
