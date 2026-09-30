@@ -33,7 +33,7 @@ type Tunnel = {
   bandwidth_limit: number
   tunnel_token?: string
   created_at?: string
-  config?: { auto_tls?: boolean; http_redirect?: boolean }
+  config?: { auto_tls?: boolean; http_redirect?: boolean; proxy_protocol_version?: string; protocol?: string }
 }
 
 type FrpcProc = { pid: number; tunnel_id: number; uptime_s: number }
@@ -153,7 +153,7 @@ async function api(pathname: string, init: RequestInit & { _retry?: boolean } = 
     throw new Error("Unauthorized after token refresh. Run lolia_setup action=import_client to re-import credentials.")
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(body?.msg ?? text).toString().slice(0, 300)}`)
-  if (body && typeof body.code === "number" && body.code !== 200) {
+  if (body && typeof body.code === "number" && (body.code < 200 || body.code >= 300)) {
     throw new Error(`API code ${body.code}: ${String(body.msg ?? "").slice(0, 300)}`)
   }
   return body
@@ -217,7 +217,7 @@ async function runPsScript(name: string, content: string, params: string[] = [])
   )
 }
 
-const SCAN_SCRIPT = `
+const SCAN_SCRIPT = String.raw`
 $ErrorActionPreference = 'SilentlyContinue'
 $items = Get-CimInstance Win32_Process -Filter "Name='frpc.exe'" | ForEach-Object {
   $m = [regex]::Match($_.CommandLine, '-{1,2}t(?:oken)?[=\s]*(\d+):([^\s"]+)')
@@ -229,10 +229,10 @@ $items = Get-CimInstance Win32_Process -Filter "Name='frpc.exe'" | ForEach-Objec
     }
   }
 }
-if ($items) { @($items) | ConvertTo-Json -Compress } else { '[]' }
+if ($items) { ConvertTo-Json -InputObject @($items) -Compress } else { '[]' }
 `
 
-const START_SCRIPT = `
+const START_SCRIPT = String.raw`
 param([string]$Exe, [string]$FrpcArgs, [string]$WorkDir)
 $ErrorActionPreference = 'Stop'
 $cmd = '"' + $Exe + '" ' + $FrpcArgs
@@ -244,7 +244,7 @@ try {
 } catch { Write-Output ("ERR " + $_.Exception.Message) }
 `
 
-const STOP_SCRIPT = `
+const STOP_SCRIPT = String.raw`
 param([int]$TunnelId, [switch]$All)
 $ErrorActionPreference = 'SilentlyContinue'
 $killed = @()
@@ -259,20 +259,31 @@ Get-CimInstance Win32_Process -Filter "Name='frpc.exe'" | ForEach-Object {
     if (-not (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue)) { $killed += $_.ProcessId }
   }
 }
-@($killed) | ConvertTo-Json -Compress
+ConvertTo-Json -InputObject @($killed) -Compress
 `
 
 async function scanFrpcProcesses(): Promise<FrpcProc[]> {
   if (!isWindows()) return []
   const r = await runPsScript("scan.ps1", SCAN_SCRIPT)
-  if (r.error) return []
+  if (r.error || r.code !== 0) throw new Error(`Failed to scan frpc processes: ${r.error || r.stderr || `exit ${r.code}`}`)
   try {
     const parsed = JSON.parse(r.stdout.trim() || "[]")
     const arr = Array.isArray(parsed) ? parsed : [parsed]
     return arr.filter((x: any) => x && Number.isFinite(Number(x.pid)))
   } catch {
-    return []
+    throw new Error(`Invalid frpc process scan output: ${r.stdout.slice(0, 300)}`)
   }
+}
+
+function stoppedPids(r: Awaited<ReturnType<typeof runPsScript>>): number[] {
+  if (r.error || r.code !== 0) throw new Error(`Failed to stop frpc: ${r.error || r.stderr || `exit ${r.code}`}`)
+  const parsed = JSON.parse(r.stdout.trim() || "[]")
+  if (!Array.isArray(parsed)) throw new Error(`Invalid frpc stop output: ${r.stdout.slice(0, 300)}`)
+  return parsed
+}
+
+async function editTunnel(name: string, changes: Record<string, unknown>) {
+  return api(`/user/tunnel/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(changes) })
 }
 
 async function resolveFrpc(): Promise<{ path: string; version?: string } | null> {
@@ -490,12 +501,13 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
             const pid = Number(m[1])
             await new Promise((res) => setTimeout(res, 1500))
             const check = await scanFrpcProcesses()
-            const alive = check.find((p) => p.pid === pid)
-            return [
-              `Started tunnel #${t.id} (${t.remark || t.name}) as DETACHED process pid=${pid}.`,
-              alive ? `Process alive after 1.5s (up=${fmtUptime(alive.uptime_s)}); frpc fetches its config from the node by token.` : "WARNING: process already exited - check the tunnel config/token (try lolia_tunnel).",
-              `target: ${tunnelLine(t)}`,
-              `frpc logs are not captured by OpenCode; the Lolia client or server status shows connectivity. Verify with lolia_tunnels.`,
+             const alive = check.find((p) => p.pid === pid)
+             return [
+               alive
+                 ? `Started tunnel #${t.id} (${t.remark || t.name}) as DETACHED process pid=${pid} (up=${fmtUptime(alive.uptime_s)}).`
+                 : `frpc pid=${pid} is not running after startup; check the tunnel config/token.`,
+               `target: ${tunnelLine(t, alive)}`,
+               `frpc logs are not captured by OpenCode; verify server connectivity with lolia_tunnels.`,
             ].join("\n")
           } catch (err) {
             return `lolia_tunnel_start failed: ${err instanceof Error ? err.message : String(err)}`
@@ -517,7 +529,7 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
             if (!isWindows()) return "Error: local frpc process management is Windows-only in this plugin."
             if (args.all) {
               const r = await runPsScript("stop.ps1", STOP_SCRIPT, ["-All"])
-              const killed = JSON.parse((r.stdout || "[]").trim() || "[]")
+               const killed = stoppedPids(r)
               return Array.isArray(killed) && killed.length
                 ? `Stopped frpc processes: ${killed.join(", ")}`
                 : "No running frpc processes found."
@@ -527,7 +539,7 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
             const t = resolveTunnel(args.tunnel, tunnels)
             if (!t) return `Tunnel "${args.tunnel}" not found. Use lolia_tunnels to list ids/names.`
             const r = await runPsScript("stop.ps1", STOP_SCRIPT, ["-TunnelId", String(t.id)])
-            const killed = JSON.parse((r.stdout || "[]").trim() || "[]")
+             const killed = stoppedPids(r)
             return Array.isArray(killed) && killed.length
               ? `Stopped tunnel #${t.id} (${t.remark || t.name}), pid(s): ${killed.join(", ")}.`
               : `Tunnel #${t.id} (${t.remark || t.name}) had no running frpc process.`
@@ -541,7 +553,7 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
         description:
           "Create a new tunnel in the user's Lolia FRP account. Requires type, node_id (from lolia_nodes) and local_port. " +
           "remote_port: pick a free port from the node's available_ports; some nodes auto-assign when omitted. " +
-          "http/https tunnels require a custom_domain verified in the Lolia dashboard. Does NOT start the tunnel - call lolia_tunnel_start after.",
+           "http/https tunnels require a verified custom_domain. For HTTPS, auto_tls/http_redirect are set by editing the newly created tunnel. Does NOT start the tunnel - call lolia_tunnel_start after.",
         args: {
           type: tool.schema.string().describe("Tunnel type: tcp | udp | http | https."),
           node_id: tool.schema.number().describe("Node id from lolia_nodes."),
@@ -550,31 +562,91 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
           local_ip: tool.schema.string().optional().describe("Local bind IP, default 127.0.0.1."),
           remark: tool.schema.string().optional().describe("Human-readable name shown in dashboards, e.g. SSH."),
           custom_domain: tool.schema.string().optional().describe("Verified custom domain (required for http/https)."),
-          auto_tls: tool.schema.boolean().optional().describe("Request automatic TLS cert for custom domains (https)."),
-          http_redirect: tool.schema.boolean().optional().describe("Redirect plain HTTP to HTTPS (https tunnels)."),
+           auto_tls: tool.schema.boolean().optional().describe("Enable Auto TLS after creation (HTTPS only)."),
+           http_redirect: tool.schema.boolean().optional().describe("Enable HTTP to HTTPS redirect after creation (HTTPS only)."),
         },
         async execute(args) {
           try {
-            const body: Record<string, unknown> = {
+             const body: Record<string, unknown> = {
               type: args.type.trim(),
               node_id: args.node_id,
               local_port: args.local_port,
               local_ip: args.local_ip?.trim() || "127.0.0.1",
-            }
+             }
+             if (args.type.trim() !== "https" && (args.auto_tls != null || args.http_redirect != null)) {
+               return "Error: auto_tls and http_redirect are only supported for HTTPS tunnels."
+             }
             if (args.remote_port != null) body.remote_port = args.remote_port
             if (args.remark?.trim()) body.remark = args.remark.trim()
             if (args.custom_domain?.trim()) body.custom_domain = args.custom_domain.trim()
-            if (args.auto_tls != null) body.auto_tls = args.auto_tls
-            if (args.http_redirect != null) body.http_redirect = args.http_redirect
-            const r = await api("/user/tunnel", { method: "POST", body: JSON.stringify(body) })
-            const d = r?.data ?? {}
-            if (d.tunnel_token) d.tunnel_token = mask(d.tunnel_token)
-            return [`Tunnel created.`, JSON.stringify(d, null, 2), "Start it with lolia_tunnel_start."].join("\n")
+             const r = await api("/user/tunnel", { method: "POST", body: JSON.stringify(body) })
+             const d = r?.data ?? {}
+             if (args.auto_tls != null || args.http_redirect != null) {
+               if (!d.name) return `Tunnel created but missing name; cannot configure TLS/redirect. Tunnel ID: ${d.id ?? "unknown"}. Edit it manually.`
+               const config: Record<string, boolean> = {}
+               if (args.auto_tls != null) config.auto_tls = args.auto_tls
+               if (args.http_redirect != null) config.http_redirect = args.http_redirect
+               try {
+                 const updated = await editTunnel(d.name, { config })
+                 Object.assign(d, updated?.data ?? {})
+               } catch (err) {
+                 return `Tunnel #${d.id} (${d.name}) was created, but configuring TLS/redirect failed: ${err instanceof Error ? err.message : String(err)}. Do not create a duplicate; use lolia_tunnel_edit to retry.`
+               }
+             }
+             if (d.tunnel_token) d.tunnel_token = mask(d.tunnel_token)
+             if (d.token) d.token = mask(d.token)
+             return [`Tunnel created.`, JSON.stringify(d, null, 2), "Start it with lolia_tunnel_start."].join("\n")
           } catch (err) {
             return `lolia_tunnel_create failed: ${err instanceof Error ? err.message : String(err)}`
           }
         },
-      }),
+       }),
+
+       lolia_tunnel_edit: tool({
+         description:
+           "Edit an existing Lolia FRP tunnel by id or name. Config changes to an active tunnel disconnect it; " +
+           "restart its local frpc process with lolia_tunnel_stop then lolia_tunnel_start to apply changes. Does not restart automatically.",
+         args: {
+           tunnel: tool.schema.string().describe("Tunnel numeric id or name."),
+           local_ip: tool.schema.string().optional().describe("New local IP."),
+           local_port: tool.schema.number().optional().describe("New local service port."),
+           custom_domain: tool.schema.string().optional().describe("Verified domain (HTTP/HTTPS only)."),
+           remark: tool.schema.string().optional().describe("New remark."),
+           auto_tls: tool.schema.boolean().optional().describe("Enable or disable Auto TLS (HTTPS only)."),
+           http_redirect: tool.schema.boolean().optional().describe("Enable or disable HTTP to HTTPS redirect (HTTPS only)."),
+           proxy_protocol_version: tool.schema.string().optional().describe("v1 or v2; empty string clears it."),
+           protocol: tool.schema.string().optional().describe("tcp or kcp; empty string clears it."),
+         },
+         async execute(args) {
+           try {
+             const tunnels = await listTunnels()
+             const t = resolveTunnel(args.tunnel, tunnels)
+             if (!t) return `Tunnel "${args.tunnel}" not found. Use lolia_tunnels to list ids/names.`
+             const changes: Record<string, unknown> = {}
+             const config: Record<string, unknown> = {}
+             for (const key of ["local_ip", "local_port", "custom_domain", "remark"] as const) {
+               if (args[key] != null) changes[key] = args[key]
+             }
+             for (const key of ["auto_tls", "http_redirect", "proxy_protocol_version", "protocol"] as const) {
+               if (args[key] != null) config[key] = args[key]
+             }
+             if (Object.keys(config).length) changes.config = config
+             if (!Object.keys(changes).length) return "Error: provide at least one field to edit."
+             if (t.type !== "https" && (args.auto_tls != null || args.http_redirect != null)) {
+               return "Error: auto_tls and http_redirect are only supported for HTTPS tunnels."
+             }
+             const r = await editTunnel(t.name, changes)
+             const d = r?.data ?? {}
+             return [
+               `Tunnel #${t.id} (${t.remark || t.name}): ${r?.msg ?? "updated"}`,
+               `config: ${JSON.stringify(d.config ?? {})}`,
+               `server=${d.status ?? "unknown"}. If it went inactive, restart its local frpc process to apply the change.`,
+             ].join("\n")
+           } catch (err) {
+             return `lolia_tunnel_edit failed: ${err instanceof Error ? err.message : String(err)}`
+           }
+         },
+       }),
 
       lolia_tunnel_delete: tool({
         description:
@@ -590,12 +662,9 @@ export const LoliaFrpPlugin: ToolFactory = async () => {
             const tunnels = await listTunnels()
             const t = resolveTunnel(args.tunnel, tunnels)
             if (!t) return `Tunnel "${args.tunnel}" not found. Use lolia_tunnels to list ids/names.`
-            const stopped = await runPsScript("stop.ps1", STOP_SCRIPT, ["-TunnelId", String(t.id)])
-            let stoppedNote = "no local process was running"
-            try {
-              const killed = JSON.parse((stopped.stdout || "[]").trim() || "[]")
-              if (Array.isArray(killed) && killed.length) stoppedNote = `stopped local pid(s): ${killed.join(", ")}`
-            } catch {}
+             const stopped = await runPsScript("stop.ps1", STOP_SCRIPT, ["-TunnelId", String(t.id)])
+             const killed = stoppedPids(stopped)
+             const stoppedNote = killed.length ? `stopped local pid(s): ${killed.join(", ")}` : "no local process was running"
             await api(`/user/tunnel/${encodeURIComponent(t.name)}`, { method: "DELETE" })
             return `Deleted tunnel #${t.id} (${t.remark || t.name}); ${stoppedNote}.`
           } catch (err) {
