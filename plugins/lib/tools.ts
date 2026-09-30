@@ -44,7 +44,10 @@ export function defineToolsPlugin(id: string, create: ToolFactory) {
             name,
             description: definition.description,
             input: z.toJSONSchema(schema),
-            options: { codemode: true, permission: name },
+            // Keep plugin tools in the model's normal tool list. Code Mode is
+            // not exposed consistently by every model/client combination,
+            // which otherwise makes installed tools appear to be missing.
+            options: { codemode: false, permission: name },
             async execute(input, context) {
               // Sessions can move after plugin setup. Resolve paths at execution time.
               const session = await ctx.session.get({ sessionID: context.sessionID })

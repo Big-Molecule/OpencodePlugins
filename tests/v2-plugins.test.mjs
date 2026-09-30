@@ -41,7 +41,7 @@ for (const id of ["bandizip", "everything-search", "image-gen", "lolia-frp", "of
     for (const [name, definition] of tools) {
       assert.equal(definition.input.type, "object", name)
       assert.equal(definition.options.permission, name)
-      assert.equal(definition.options.codemode, true)
+      assert.equal(definition.options.codemode, false)
       assert.equal(typeof definition.execute, "function")
       assert.ok(definition.description.length > 0)
       assert.doesNotThrow(() => JSON.stringify(definition.input))

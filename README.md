@@ -37,6 +37,9 @@ The default install targets **OpenCode V2 (2.0.15+)** and copies these six migra
 It installs the pinned `@opencode/plugin` and Zod dependencies under the OpenCode config directory,
 and copies `plugins/lib/` alongside the entrypoints. Node.js/npm must be available.
 
+The migrated plugin tools are registered as ordinary model tools rather than Code Mode-only tools.
+This keeps them visible to OpenChamber and to models that do not expose the Code Mode catalog.
+
 `aijavis-sse-filter`, `latex-normalize`, and `local-markdown-images` are excluded from the default
 install; their existing files are left alone. Their V1 implementations are not V2-compatible.
 
