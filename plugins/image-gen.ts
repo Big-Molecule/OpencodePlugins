@@ -7,7 +7,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs"
-import { basename, dirname, join } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { homedir } from "node:os"
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "image-gen.json")
@@ -28,6 +28,7 @@ const API_ENV = Object.freeze({
   host: "IMAGE_GEN_API_HOST",
   port: "IMAGE_GEN_API_PORT",
   path: "IMAGE_GEN_API_PATH",
+  editsPath: "IMAGE_GEN_API_EDITS_PATH",
   modelsPath: "IMAGE_GEN_API_MODELS_PATH",
   key: "IMAGE_GEN_API_KEY",
   model: "IMAGE_GEN_API_MODEL",
@@ -56,6 +57,7 @@ type StoredConfig = {
     domain?: string
     port?: number | null
     path?: string
+    editsPath?: string
     modelsPath?: string
     key?: string
     model?: string
@@ -71,6 +73,8 @@ type ResolvedApi = {
   port: number | null
   path: string
   endpoint: string | null
+  editsPath: string | null
+  editsEndpoint: string | null
   modelsPath: string
   modelsEndpoint: string | null
   key: string | null
@@ -181,6 +185,7 @@ function setupGuide(reason: string) {
     "    host=<api-host only, e.g. api.example.com>",
     "    key=<api-key>",
     "    path=/v1/images/generations   (optional)",
+    "    edits_path=auto              (optional; derive /images/edits from path)",
     "    models_path=/v1/models        (optional)",
     "  After save, connection is verified automatically (unless skip_verify=true).",
     "",
@@ -208,7 +213,7 @@ function saveConfig(cfg: StoredConfig) {
   }
 }
 
-function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true): ResolvedApi {
+export function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true): ResolvedApi {
   const stored = cfg?.api && typeof cfg.api === "object" ? cfg.api : {}
   const env = useEnv ? process.env : {}
 
@@ -221,6 +226,8 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
   )
   const port = normalizePort(firstDefined<string | number>(env[API_ENV.port], stored.port, DEFAULT_API.port))
   const path = normalizePath(firstDefined(env[API_ENV.path], stored.path, DEFAULT_API.path))
+  const rawEditsPath = firstDefined(env[API_ENV.editsPath], stored.editsPath)
+  const editsPath = !rawEditsPath || rawEditsPath === "auto" ? null : normalizePath(rawEditsPath)
   const modelsPath = normalizePath(
     firstDefined(env[API_ENV.modelsPath], stored.modelsPath, DEFAULT_API.modelsPath),
   )
@@ -256,6 +263,8 @@ function resolveApiConfig(cfg: StoredConfig | null = loadConfig(), useEnv = true
     port,
     path,
     endpoint,
+    editsPath,
+    editsEndpoint: endpoint ? resolveImageProtocolEndpoints(endpoint, editsPath).edits : null,
     modelsPath,
     modelsEndpoint,
     key,
@@ -274,6 +283,7 @@ function apiForStorage(api: ResolvedApi) {
     host: api.host,
     port: api.port,
     path: api.path,
+    editsPath: api.editsPath || undefined,
     modelsPath: api.modelsPath,
     key: api.key || undefined,
     model: api.model || undefined,
@@ -292,27 +302,49 @@ type ImagePayload = {
 type SourceImage = {
   base64: string
   mimeType: string
+  filename?: string
 }
 
 type ImageRequestResult =
   | { ok: true; images: ImagePayload[]; route: string; warning?: string }
-  | { ok: false; error: string }
+  | { ok: false; error: string; fallbackAllowed?: boolean }
 
-export function resolveImageProtocolEndpoints(endpoint: string) {
+export function resolveImageProtocolEndpoints(endpoint: string, editsPath?: string | null) {
   const imageUrl = new URL(endpoint)
   imageUrl.search = ""
   imageUrl.hash = ""
 
   const responsesUrl = new URL(imageUrl)
-  const responsesMatch = responsesUrl.pathname.match(/^(.*)\/v1\/images\/generations\/?$/i)
+  const responsesMatch = responsesUrl.pathname.match(/^(.*)\/images\/generations\/?$/i)
   responsesUrl.pathname = responsesMatch
-    ? `${responsesMatch[1]}/v1/responses`
+    ? `${responsesMatch[1]}/responses`
     : "/v1/responses"
+  const editsUrl = new URL(imageUrl)
+  editsUrl.pathname = editsPath
+    ? normalizePath(editsPath)
+    : responsesMatch ? `${responsesMatch[1]}/images/edits` : "/v1/images/edits"
 
   return {
     images: imageUrl.toString(),
+    edits: editsUrl.toString(),
     responses: responsesUrl.toString(),
   }
+}
+
+function buildImageEditForm(model: string, prompt: string, size: string, image: SourceImage, count: number, mask?: SourceImage) {
+  const form = new FormData()
+  form.set("model", model)
+  form.set("prompt", prompt)
+  form.set("size", size)
+  form.set("n", String(count))
+  const attach = (field: string, source: SourceImage) => {
+    const bytes = Buffer.from(source.base64, "base64")
+    const extension = extensionForImage(bytes, source.mimeType)
+    form.set(field, new Blob([bytes], { type: source.mimeType }), source.filename || `${field}.${extension}`)
+  }
+  attach("image", image)
+  if (mask) attach("mask", mask)
+  return form
 }
 
 export function buildResponsesImageRequest(
@@ -777,15 +809,18 @@ async function postImageRequest(
   body: unknown,
   route: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<ImageRequestResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
   try {
+    requestSignal.throwIfAborted()
     const response = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
+      body: body instanceof FormData ? body : JSON.stringify(body),
+      signal: requestSignal,
     })
     if (!response.ok) {
       const responseBody = await response.text()
@@ -798,6 +833,7 @@ async function postImageRequest(
       return {
         ok: false,
         error: `HTTP ${response.status}: ${extractErrorMessage(responseBody, json)}`,
+        fallbackAllowed: [400, 404, 405, 415, 422, 501].includes(response.status),
       }
     }
 
@@ -805,18 +841,54 @@ async function postImageRequest(
     try {
       payload = await response.json()
     } catch {
-      return { ok: false, error: "Response was not valid JSON." }
+      return { ok: false, error: "Response was not valid JSON.", fallbackAllowed: false }
     }
     const images = extractImagePayloads(payload)
-    if (images.length === 0) return { ok: false, error: "No image data in response." }
-    return { ok: true, images, route }
+    // Some compatible Images servers return signed download URLs instead of base64.
+    // Never forward the provider's Authorization header to an image download host.
+    const downloadErrors: string[] = []
+    const data = (payload as { data?: unknown[] } | null)?.data
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (!item || typeof item !== "object") continue
+        const record = item as Record<string, unknown>
+        if (extractImagePayloads({ data: [record] }).length || typeof record.url !== "string") continue
+        if (record.url.startsWith("data:")) continue
+        try {
+          const imageUrl = new URL(record.url)
+          if (!["http:", "https:"].includes(imageUrl.protocol)) throw new Error("Unsupported image URL protocol.")
+          const downloaded = await fetch(imageUrl, { signal: requestSignal })
+          if (!downloaded.ok) throw new Error(`Image download HTTP ${downloaded.status}`)
+          const bytes = Buffer.from(await downloaded.arrayBuffer())
+          if (!detectImageExtension(bytes)) throw new Error("Image URL did not return a supported image.")
+          images.push({ base64: bytes.toString("base64"), mimeType: downloaded.headers.get("content-type") })
+        } catch (err: any) {
+          requestSignal.throwIfAborted()
+          downloadErrors.push(String(err?.message || err))
+        }
+      }
+    }
+    if (images.length === 0) {
+      return {
+        ok: false,
+        error: downloadErrors.length ? downloadErrors.join("; ") : "No image data in response.",
+        fallbackAllowed: downloadErrors.length === 0,
+      }
+    }
+    return {
+      ok: true, images, route,
+      ...(downloadErrors.length ? { warning: `${downloadErrors.length} image downloads failed: ${downloadErrors.join("; ")}` } : {}),
+    }
   } catch (err: any) {
     return {
       ok: false,
       error:
-        err?.name === "AbortError"
+        signal?.aborted
+          ? "Cancelled."
+          : controller.signal.aborted
           ? `Timeout (${timeoutMs / 1000}s)`
           : String(err?.message || err),
+      fallbackAllowed: false,
     }
   } finally {
     clearTimeout(timer)
@@ -828,6 +900,7 @@ async function requestResponsesImage(
   prompt: string,
   image: SourceImage | undefined,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<ImageRequestResult> {
   const endpoints = resolveImageProtocolEndpoints(api.endpoint!)
   return postImageRequest(
@@ -839,6 +912,7 @@ async function requestResponsesImage(
     buildResponsesImageRequest(api.model!, prompt, image),
     "responses-fallback",
     timeoutMs,
+    signal,
   )
 }
 
@@ -849,32 +923,40 @@ export async function requestImagePayloads(
   image?: SourceImage,
   count = 1,
   timeoutMs = 220_000,
+  options: { mask?: SourceImage; signal?: AbortSignal } = {},
 ): Promise<ImageRequestResult> {
   if (!api.endpoint || !api.model || !api.key) {
     return { ok: false, error: "API host, model, and key are required." }
   }
 
-  const dataUrl = image ? `data:${image.mimeType};base64,${image.base64}` : undefined
+  if (options.mask && !image) return { ok: false, error: "A mask requires a source image." }
+  if (options.signal?.aborted) return { ok: false, error: "Cancelled." }
+  const endpoint = image
+    ? api.editsEndpoint || resolveImageProtocolEndpoints(api.endpoint, api.editsPath).edits
+    : api.endpoint
   const imagesApi = await postImageRequest(
-    api.endpoint,
+    endpoint,
     {
-      "Content-Type": "application/json",
+      ...(image ? {} : { "Content-Type": "application/json" }),
       Authorization: `Bearer ${api.key}`,
     },
-    {
+    image ? buildImageEditForm(api.model, prompt, size, image, count, options.mask) : {
       model: api.model,
       prompt,
       n: count,
       size,
-      ...(dataUrl ? { image: dataUrl } : {}),
     },
-    "images-api",
+    image ? "images-edits" : "images-api",
     timeoutMs,
+    options.signal,
   )
   if (imagesApi.ok) return imagesApi
+  // A Responses compatibility request cannot preserve a mask. Do not silently drop it.
+  if (options.mask) return { ok: false, error: `Images edits failed (${imagesApi.error}); Responses fallback disabled because mask is set.` }
+  if (!imagesApi.fallbackAllowed || options.signal?.aborted) return imagesApi
 
   if (count <= 1) {
-    const responses = await requestResponsesImage(api, prompt, image, timeoutMs)
+    const responses = await requestResponsesImage(api, prompt, image, timeoutMs, options.signal)
     if (responses.ok) return responses
     return {
       ok: false,
@@ -885,7 +967,7 @@ export async function requestImagePayloads(
   const attempts = await mapPool(
     Array.from({ length: count }),
     Math.min(count, 3),
-    () => requestResponsesImage(api, prompt, image, timeoutMs),
+    () => requestResponsesImage(api, prompt, image, timeoutMs, options.signal),
   )
   const images: ImagePayload[] = []
   const routes = new Set<string>()
@@ -1033,16 +1115,33 @@ async function generateOne(
   size: string,
   outputDir: string,
   timeoutMs = 220_000,
+  signal?: AbortSignal,
 ) {
   const start = Date.now()
-  const requested = await requestImagePayloads(api, prompt, size, undefined, 1, timeoutMs)
+  const requested = await requestImagePayloads(api, prompt, size, undefined, 1, timeoutMs, { signal })
   const elapsed = Date.now() - start
   if (!requested.ok) return { ok: false as const, elapsed, error: requested.error }
   try {
     const saved = saveImagePayload(requested.images[0], outputDir, `img_${timestamp()}`)
-    return { ok: true as const, elapsed, ...saved, route: requested.route }
+    return { ok: true as const, elapsed, ...saved, route: requested.route, warning: requested.warning }
   } catch (err: any) {
     return { ok: false as const, elapsed, error: String(err?.message || err) }
+  }
+}
+
+function readSourceImage(path: string, mask = false): SourceImage {
+  if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`Image file not found: ${path}`)
+  const limit = (mask ? 4 : 50) * 1024 * 1024
+  if (statSync(path).size >= limit) throw new Error(`${mask ? "Mask" : "Source image"} must be less than ${mask ? 4 : 50} MB.`)
+  const bytes = readFileSync(path)
+  const extension = detectImageExtension(bytes)
+  if (!extension || !(mask ? ["png"] : ["png", "jpg", "webp"]).includes(extension)) {
+    throw new Error(mask ? "mask_path must contain a PNG image." : "image_path must contain a PNG, JPEG, or WebP image.")
+  }
+  return {
+    base64: bytes.toString("base64"),
+    mimeType: extension === "jpg" ? "image/jpeg" : `image/${extension}`,
+    filename: `${basename(path).replace(/\.[^.]+$/, "")}.${extension}`,
   }
 }
 
@@ -1054,22 +1153,21 @@ async function editOne(
   outputDir: string,
   count = 1,
   timeoutMs = 250_000,
+  maskPath?: string,
+  signal?: AbortSignal,
 ) {
   const sourceName = basename(imagePath)
-  if (!existsSync(imagePath)) {
-    return { ok: false as const, elapsed: 0, error: `File not found: ${imagePath}`, sourceName }
+  const sourceImage = readSourceImage(imagePath)
+  const mask = maskPath ? readSourceImage(maskPath, true) : undefined
+  if (mask) {
+    const imageData = Buffer.from(sourceImage.base64, "base64")
+    const dimensions = imageDimensions(imageData, detectImageExtension(imageData)!)
+    if (dimensions === "unknown" || dimensions !== imageDimensions(Buffer.from(mask.base64, "base64"), "png")) {
+      throw new Error("Mask dimensions must match the source image.")
+    }
   }
-  const imageData = readFileSync(imagePath)
-  const lowerPath = imagePath.toLowerCase()
-  const mimeType =
-    lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")
-      ? "image/jpeg"
-      : lowerPath.endsWith(".webp")
-        ? "image/webp"
-        : "image/png"
-  const sourceImage = { base64: imageData.toString("base64"), mimeType }
   const start = Date.now()
-  const requested = await requestImagePayloads(api, prompt, size, sourceImage, count, timeoutMs)
+  const requested = await requestImagePayloads(api, prompt, size, sourceImage, count, timeoutMs, { mask, signal })
   const elapsed = Date.now() - start
   if (!requested.ok) return { ok: false as const, elapsed, error: requested.error, sourceName }
 
@@ -1127,6 +1225,7 @@ function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
     `Model:       ${progress.model ? "ok" : "not selected yet"}`,
     `Ready:       ${progress.ready ? "yes" : "no"}`,
     `Endpoint:    ${api.endpoint || "(host not set)"}`,
+    `Edits URL:   ${api.editsEndpoint || "(host not set)"} (${api.editsPath ? "custom" : "auto"})`,
     `Models URL:  ${api.modelsEndpoint || "(host not set)"}`,
     `Model id:    ${api.model ? `${api.model} (${api.modelSource})` : "NOT SET — use image_list_models then set_model"}`,
     `API key:     ${api.key ? `set (${api.keySource}, ${previewSecret(api.key)})` : "NOT SET"}`,
@@ -1152,6 +1251,7 @@ function formatStatus(cfg: StoredConfig | null, api: ResolvedApi) {
     lines.push("- image_configure action=set_model model=<chosen-id>")
   } else {
     lines.push("- image_generate prompt=\"...\"")
+    lines.push("- image_edit image_path=... prompt=\"...\" (optional mask_path)")
     lines.push("- or image_list_models to change model")
   }
 
@@ -1230,6 +1330,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
             .optional()
             .describe('Port number or "default" (set_api)'),
           path: tool.schema.string().optional().describe("Image generations path, e.g. /v1/images/generations"),
+          edits_path: tool.schema.string().optional().describe('Image edits path, e.g. /v1/images/edits; "auto" derives it from the generations path (default).'),
           models_path: tool.schema.string().optional().describe("Models list path, e.g. /v1/models"),
           model: tool.schema
             .string()
@@ -1324,6 +1425,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
                 args.host,
                 args.port,
                 args.path,
+                args.edits_path,
                 args.models_path,
                 args.model,
                 args.key,
@@ -1341,6 +1443,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
                 host: nextHost,
                 port: args.port === undefined ? current.port : normalizePort(args.port),
                 path: firstDefined(args.path, current.path),
+                editsPath: args.edits_path === undefined ? current.editsPath || undefined : args.edits_path,
                 modelsPath: firstDefined(args.models_path, current.modelsPath),
                 key: firstDefined(args.key, current.key) || undefined,
                 // model optional: only write when user provided it
@@ -1360,6 +1463,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
                 host: saved.host,
                 port: saved.port,
                 path: saved.path,
+                editsPath: saved.editsPath || undefined,
                 modelsPath: saved.modelsPath,
                 key: saved.key || undefined,
                 model: saved.model || undefined,
@@ -1369,6 +1473,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
               const lines = [
                 "API connection saved.",
                 `Endpoint: ${saved.endpoint}`,
+                `Edits:    ${saved.editsEndpoint}`,
                 `Models:   ${saved.modelsEndpoint}`,
                 `Model:    ${saved.model || "NOT SET"}`,
                 `Key:      ${previewSecret(saved.key) || "not set"}`,
@@ -1489,7 +1594,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
       image_generate: tool({
         description: [
           "Generate image(s) via the configured image API.",
-          "All models use Images API first, then Responses API if it fails.",
+          "Uses Images generations first, then Responses on compatibility errors; no fallback on auth, rate-limit, timeout or network failures.",
           "Use when the user wants to create/draw images with Image Gen.",
           "Requires host+key+model. If model missing, run image_list_models and set_model first.",
           "quality: 1K|2K|4K; ratio: square|landscape|portrait; count 1-4 variations of the same prompt.",
@@ -1505,9 +1610,9 @@ export const ImageGenPlugin: ToolFactory = async () => {
           ratio: tool.schema.enum(["square", "landscape", "portrait"]).optional(),
           count: tool.schema.number().optional().describe("Variations of one prompt (1-4)"),
           concurrency: tool.schema.number().optional().describe("Batch concurrency (1-10)"),
-          output_dir: tool.schema.string().optional().describe("Directory to save PNGs"),
+          output_dir: tool.schema.string().optional().describe("Directory to save images (format detected from response)"),
         },
-        async execute(args) {
+        async execute(args, context) {
           try {
             const cfg = loadConfig()
             const api = resolveApiConfig(cfg)
@@ -1534,7 +1639,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
             const size = resolveSize(quality, ratio)
             if (!size) return `Error: invalid quality="${quality}" or ratio="${ratio}".`
 
-            const outputDir = resolveOutputDir(args.output_dir)
+            const outputDir = resolveOutputDir(args.output_dir?.trim() ? resolve(context.directory, args.output_dir.trim()) : undefined)
             const concurrency = Math.max(
               1,
               Math.min(
@@ -1547,7 +1652,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
             if (prompts.length === 1 && !args.batch_prompts) {
               const count = Math.max(1, Math.min(args.count ?? cfg?.quickMode?.count ?? DEFAULTS.count, 4))
               if (count === 1) {
-                const result = await generateOne(api, prompts[0], size, outputDir)
+                const result = await generateOne(api, prompts[0], size, outputDir, undefined, context.signal)
                 if (!result.ok) return `Generation failed: ${result.error}`
                 return [
                   "Image generated.",
@@ -1559,6 +1664,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
                   `Time:    ${(result.elapsed / 1000).toFixed(1)}s`,
                   `File:    ${result.path}`,
                   `File size: ${result.fileSize}`,
+                  ...(result.warning ? [`Warning: ${result.warning}`] : []),
                 ].join("\n")
               }
               prompts = Array(count).fill(prompts[0])
@@ -1566,7 +1672,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
 
             const startAll = Date.now()
             const results = await mapPool(prompts, concurrency, async (prompt) => {
-              const r = await generateOne(api, prompt, size, outputDir)
+              const r = await generateOne(api, prompt, size, outputDir, undefined, context.signal)
               return { prompt, ...r }
             })
             const totalTime = Date.now() - startAll
@@ -1584,6 +1690,7 @@ export const ImageGenPlugin: ToolFactory = async () => {
                 )
                 lines.push(`    ${r.path}`)
                 lines.push(`    prompt: ${r.prompt}`)
+                if (r.warning) lines.push(`    warning: ${r.warning}`)
               } else {
                 lines.push(`[${i + 1}] fail  ${r.error}`)
                 lines.push(`    prompt: ${r.prompt}`)
@@ -1600,19 +1707,21 @@ export const ImageGenPlugin: ToolFactory = async () => {
       image_edit: tool({
         description: [
           "Edit an existing image with the configured image API.",
-          "All models use Images API first, then Responses API if it fails.",
+          "Uploads multipart files to Images edits (default /v1/images/edits), then tries Responses on compatibility errors without a mask.",
           "Use when the user wants to modify a local image (background change, add/remove objects, style transfer).",
           "image_path must be a readable local file (png/jpg/webp).",
+          "Optional mask_path is a same-size PNG with transparent edit regions; masks disable Responses fallback. Use image_generate for text-only generation.",
         ].join(" "),
         args: {
           image_path: tool.schema.string().describe("Absolute or relative path to source image"),
+          mask_path: tool.schema.string().optional().describe("Optional PNG mask, <4 MB, same dimensions as source. Fully transparent areas are edited."),
           prompt: tool.schema.string().describe("Edit instruction"),
           quality: tool.schema.enum(["1K", "2K", "4K"]).optional(),
           ratio: tool.schema.enum(["square", "landscape", "portrait"]).optional(),
-          count: tool.schema.number().optional().describe("Number of edit variants 1-4"),
+          count: tool.schema.number().int().min(1).max(4).optional().describe("Number of edit variants 1-4"),
           output_dir: tool.schema.string().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           try {
             const cfg = loadConfig()
             const api = resolveApiConfig(cfg)
@@ -1627,8 +1736,11 @@ export const ImageGenPlugin: ToolFactory = async () => {
             if (!size) return `Error: invalid quality="${quality}" or ratio="${ratio}".`
 
             const count = Math.max(1, Math.min(args.count ?? 1, 4))
-            const outputDir = resolveOutputDir(args.output_dir)
-            const result = await editOne(api, args.image_path.trim(), args.prompt.trim(), size, outputDir, count)
+            const outputDir = resolveOutputDir(args.output_dir?.trim() ? resolve(context.directory, args.output_dir.trim()) : undefined)
+            const result = await editOne(
+              api, resolve(context.directory, args.image_path.trim()), args.prompt.trim(), size, outputDir, count,
+              undefined, args.mask_path?.trim() ? resolve(context.directory, args.mask_path.trim()) : undefined, context.signal,
+            )
             if (!result.ok) {
               return `Edit failed (${result.sourceName}): ${result.error}`
             }

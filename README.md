@@ -115,7 +115,52 @@ Operates Lolia FRP (lolia.link) tunnels through the same OAuth API the desktop c
 
 ### image-gen
 
-See prior docs in conversation / `image_status` tool. Config: `~\.config\opencode\image-gen.json`.
+OpenAI-compatible image generation and editing. Config: `~\.config\opencode\image-gen.json`.
+
+| Tool | Purpose |
+|------|---------|
+| `image_status` | Show connection, model, generation URL and resolved edits URL |
+| `image_configure` | Save connection/model/defaults or verify connection |
+| `image_list_models` | Discover models before selecting one |
+| `image_generate` | Text-to-image, variants, or a batch of prompts |
+| `image_edit` | Edit a local PNG/JPEG/WebP; optionally upload a PNG mask |
+
+**Setup:** `image_status` → `image_configure action=set_api host=... key=...` →
+`image_list_models` → `image_configure action=set_model model=...`. Setup can be cancelled at any time.
+
+**Endpoints and transport:**
+
+- Generation sends JSON to `path` (default `/v1/images/generations`).
+- Editing sends `multipart/form-data` with `model`, `prompt`, `size`, `n`, and an actual
+  `image` file to `/v1/images/edits`. A supplied mask is uploaded as the `mask` file.
+- The edit path is derived automatically, preserving prefixes: `/proxy/v1/images/generations`
+  → `/proxy/v1/images/edits`. For an unrecognized generation path it defaults to `/v1/images/edits`.
+  Override with `image_configure action=set_api edits_path=/custom/images/edits`; use
+  `edits_path=auto` to reset. Old configurations need no migration.
+- The stored override is `api.editsPath`; environment variable `IMAGE_GEN_API_EDITS_PATH`
+  takes precedence (also accepts `auto`). Generation still uses `api.path` / `IMAGE_GEN_API_PATH`.
+- Compatibility errors (HTTP 400/404/405/415/422/501), or a JSON response with no image,
+  can fall back to the existing Responses compatibility route. Edits carry the original image
+  as `input_image`; generation sends a text input. This requires provider/model support for
+  that Responses request shape. Authentication, rate-limit, other server, network and timeout
+  failures do not trigger fallback. Session cancellation aborts the active requests.
+- Responses fallback is disabled when a mask is supplied so the masked region is never silently lost.
+- Both base64 image results and `data[].url` results are supported. URL downloads do not receive
+  the API authorization header; download failures do not trigger a second generation.
+
+**Editing examples** (tool arguments):
+
+```text
+image_edit image_path="C:\Pictures\source.png" prompt="Replace the background with a beach" quality=1K
+image_edit image_path="source.png" mask_path="mask.png" prompt="Add flowers in the transparent region" output_dir="edited"
+```
+
+Source images must be under 50 MB; masks must be PNG, under 4 MB, with the same dimensions
+as the source. Fully transparent mask regions indicate where to edit. Input formats are
+detected from file bytes. Relative paths use the current session directory. Results default
+to `~/Pictures/image-gen` and are saved with the detected PNG/JPEG/WebP/GIF extension.
+`count` selects 1–4 edit variants. `quality=1K|2K|4K` is a resolution preset, not the provider's
+`quality` enum; the chosen model must support the requested dimensions (use `1K` for standard sizes).
 
 ### everything-search
 
