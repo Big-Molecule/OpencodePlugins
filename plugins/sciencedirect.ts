@@ -1,4 +1,4 @@
-import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
+﻿import { defineToolsPlugin, type ToolFactory, tool } from "./lib/tools.ts"
 import { randomUUID } from "node:crypto"
 import {
   chmodSync,
@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { homedir } from "node:os"
+import { createRequire } from "node:module"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
 const API_BASE = "https://api.elsevier.com"
@@ -93,6 +94,7 @@ type StoredConfig = {
   api_key?: string
   instToken?: string
   inst_token?: string
+  proxy?: string
 }
 
 type ScienceDirectPluginOptions = {
@@ -181,6 +183,10 @@ function storedInstToken(config: StoredConfig | null) {
   return nonEmptyConfigString(config?.instToken) || nonEmptyConfigString(config?.inst_token)
 }
 
+function storedProxy(config: StoredConfig | null) {
+  return nonEmptyConfigString(config?.proxy)
+}
+
 function nonEmptyConfigString(value: unknown) {
   return typeof value === "string" ? value.trim() : ""
 }
@@ -252,6 +258,54 @@ function readSecretFromFile(filePath: string, baseDirectory: string | undefined,
   return normalizeSecretValue(content, label)
 }
 
+function validateProxyUrl(value: string, baseDirectory: string | undefined) {
+  const raw = value.trim()
+  if (!raw) throw new Error("proxy is required for action=set_proxy.")
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new Error("proxy must be an absolute URL, for example http://100.89.105.117:8899.")
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("proxy must use http:// or https://.")
+  }
+  if (!parsed.port) {
+    throw new Error("proxy must include an explicit port.")
+  }
+  void baseDirectory
+  return `${parsed.protocol}//${parsed.host}`
+}
+
+function proxyFor(env: NodeJS.ProcessEnv = process.env, configPath = CONFIG_PATH) {
+  const fromEnv = env.SCIENCEDIRECT_PROXY?.trim()
+  if (fromEnv) return fromEnv
+  const fromConfig = loadConfig(configPath)
+  return typeof fromConfig?.proxy === "string" ? fromConfig.proxy.trim() : ""
+}
+
+// Only Elsevier requests use the proxy: undici ProxyAgent as a per-request dispatcher,
+// so model API traffic is never dragged out through the campus egress.
+const requireFromConfig = createRequire(join(homedir(), ".config", "opencode", "noop.js"))
+const dispatcherCache = new Map<string, unknown>()
+
+function proxyDispatcher(proxyUrl: string, fetchImpl?: FetchLike): unknown {
+  if (!proxyUrl) return undefined
+  if (dispatcherCache.has(proxyUrl)) return dispatcherCache.get(proxyUrl)
+  try {
+    const undici = requireFromConfig("undici") as {
+      ProxyAgent: new (url: string) => unknown
+    }
+    const agent = new undici.ProxyAgent(proxyUrl)
+    dispatcherCache.set(proxyUrl, agent)
+    void fetchImpl
+    return agent
+  } catch {
+    dispatcherCache.set(proxyUrl, undefined)
+    return undefined
+  }
+}
+
 function buildHeaders(
   credentials: ElsevierCredentials,
   accept: string,
@@ -313,6 +367,7 @@ async function requestElsevier(
     timeoutMs?: number
     maxResponseBytes?: number
     fetchImpl?: FetchLike
+    proxy?: string
     signal?: AbortSignal
   },
 ): Promise<ElsevierResponse> {
@@ -327,6 +382,7 @@ async function requestElsevier(
     controller.abort()
   }, timeoutMs)
   const fetchImpl = options.fetchImpl ?? fetch
+  const dispatcher = proxyDispatcher(options.proxy ?? proxyFor())
 
   try {
     const response = await fetchImpl(`${API_BASE}${path}`, {
@@ -340,7 +396,8 @@ async function requestElsevier(
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       redirect: "manual",
       signal: controller.signal,
-    })
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit)
     const contentType = response.headers.get("content-type") || ""
     const rateLimit = {
       limit: response.headers.get("x-ratelimit-limit") || undefined,
@@ -630,6 +687,7 @@ async function verifyCredentials(
   sessionToken: string | undefined,
   fetchImpl?: FetchLike,
   signal?: AbortSignal,
+  proxy?: string,
 ): Promise<VerificationOutcome> {
   const searchResponse = await requestElsevier(SEARCH_PATH, {
     credentials,
@@ -642,6 +700,7 @@ async function verifyCredentials(
     sessionToken,
     maxResponseBytes: 1024 * 1024,
     fetchImpl,
+    proxy,
     signal,
   })
 
@@ -676,6 +735,7 @@ async function verifyCredentials(
       sessionToken,
       maxResponseBytes: 1024 * 1024,
       fetchImpl,
+      proxy,
       signal,
     })
     if (isInvalidApiKey(metadataResponse)) {
@@ -1249,6 +1309,7 @@ function authenticationToken(payload: unknown, rawBody: string) {
 
 function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): ToolFactory {
   const configPath = options.configPath ?? CONFIG_PATH
+  const proxy = () => proxyFor(process.env, configPath)
   const fetchImpl = options.fetchImpl
   const inMemoryAuth: { current: InMemoryAuth | null } = { current: null }
   let configGeneration = 0
@@ -1285,6 +1346,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
               `API endpoint: ${API_BASE}`,
               `Config file: ${!configFileExists(configPath) ? `not created (${configPath})` : localConfig ? configPath : `invalid JSON (${configPath})`}`,
               `API key: configured (${apiKeySource(process.env, configPath)})`,
+              `Proxy (Elsevier only): ${proxyFor(process.env, configPath) || "not set (direct connection)"}`,
               `Institution token: ${credentials.instToken ? `configured (${instTokenSource(process.env, configPath)})` : "not set"}`,
               `Environment authtoken: ${credentials.authToken ? "configured" : "not set"}`,
               `OAuth token: ${credentials.oauthToken ? "configured" : "not set"}`,
@@ -1298,15 +1360,20 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
         sciencedirect_configure: tool({
           description: [
             "Configure, verify, or clear Elsevier ScienceDirect API credentials in ~/.config/opencode/sciencedirect.json.",
-            "Actions: set_key | verify | clear.",
+            "Actions: set_key | verify | clear | set_proxy | clear_proxy.",
+            "set_proxy routes only Elsevier requests through an HTTP proxy (for example a campus machine on Tailscale), leaving model traffic untouched.",
             "Supports passing secrets directly (api_key / inst_token) or via secret file paths (api_key_file / inst_token_file, e.g. from openchamber_secret).",
             "Valid keys are saved even if the current IP is off-campus, so sciencedirect_authenticate or inst_token can be used afterward.",
             "Never echo secret values in chat.",
           ].join(" "),
           args: {
             action: tool.schema
-              .enum(["set_key", "verify", "clear"])
-              .describe("Configuration action: set_key | verify | clear."),
+              .enum(["set_key", "verify", "clear", "set_proxy", "clear_proxy"])
+              .describe("Configuration action: set_key | verify | clear | set_proxy | clear_proxy."),
+            proxy: tool.schema
+              .string()
+              .optional()
+              .describe("HTTP proxy URL for Elsevier requests only, e.g. http://100.89.105.117:8899."),
             api_key: tool.schema
               .string()
               .optional()
@@ -1347,6 +1414,35 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                 ].join("\n")
               }
 
+              if (args.action === "set_proxy" || args.action === "clear_proxy") {
+                const currentConfig = loadConfig(configPath) ?? {}
+                const proxyValue =
+                  args.action === "clear_proxy" ? "" : validateProxyUrl(args.proxy ?? "", context?.directory)
+                if (context?.abort.aborted) {
+                  return "ScienceDirect configuration change cancelled; the proxy setting was not saved."
+                }
+                await withConfigLock(configPath, context?.abort, () => {
+                  configGeneration += 1
+                  const nextConfig: StoredConfig = {
+                    ...currentConfig,
+                    version: 1,
+                    mutationId: randomUUID(),
+                    ...(proxyValue ? { proxy: proxyValue } : {}),
+                  }
+                  if (!proxyValue) delete nextConfig.proxy
+                  saveConfig(nextConfig, configPath)
+                })
+                dispatcherCache.clear()
+                return proxyValue
+                  ? [
+                      "ScienceDirect proxy saved; only Elsevier requests use it.",
+                      `Proxy: ${proxyValue}`,
+                      "Model API traffic and other tools are unaffected.",
+                      "Run sciencedirect_authenticate to confirm the campus egress IP.",
+                    ].join("\n")
+                  : "ScienceDirect proxy cleared; Elsevier requests now go out directly."
+              }
+
               if (args.action === "verify") {
                 const credentials = getElsevierCredentials(process.env, configPath)
                 const missing = requireApiKey(credentials, configPath)
@@ -1356,6 +1452,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                   activeAuthToken(inMemoryAuth),
                   fetchImpl,
                   context?.abort,
+                  proxy(),
                 )
                 return formatVerificationSummary(outcome, [
                   credentials.apiKey,
@@ -1423,6 +1520,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                     activeAuthToken(inMemoryAuth),
                     fetchImpl,
                     context?.abort,
+                    proxy(),
                   )
                   if (outcome.invalidKey) {
                     return [
@@ -1453,6 +1551,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                     mutationId: randomUUID(),
                     apiKey: candidateApiKey,
                     ...(candidateInstToken ? { instToken: candidateInstToken } : {}),
+                    ...(storedProxy(currentConfig) ? { proxy: storedProxy(currentConfig) } : {}),
                   }
                   saveConfig(nextConfig, configPath)
                   return true
@@ -1515,6 +1614,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
               credentials: { ...credentials, authToken: undefined },
               accept: "application/json",
               fetchImpl,
+              proxy: proxy(),
               signal: context?.abort,
             })
             const payload = parseJson(response.body)
@@ -1614,6 +1714,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                 accept: "application/json",
                 sessionToken,
                 fetchImpl,
+                proxy: proxy(),
                 signal: context?.abort,
               })
               if (!metaResponse.ok) return formatApiFailure(metaResponse, "metadata search", secrets)
@@ -1635,6 +1736,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
               body: request.body,
               sessionToken,
               fetchImpl,
+              proxy: proxy(),
               signal: context?.abort,
             })
 
@@ -1663,6 +1765,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                 accept: "application/json",
                 sessionToken,
                 fetchImpl,
+                proxy: proxy(),
                 signal: context?.abort,
               })
               if (metaResponse.ok) {
@@ -1781,6 +1884,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                   accept: "application/json",
                   sessionToken,
                   fetchImpl,
+                  proxy: proxy(),
                   signal: context?.abort,
                 },
               )
@@ -1804,6 +1908,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                     accept: "application/json",
                     sessionToken,
                     fetchImpl,
+                    proxy: proxy(),
                     signal: context?.abort,
                   },
                 )
@@ -1831,6 +1936,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                 accept: "text/plain",
                 sessionToken,
                 fetchImpl,
+                proxy: proxy(),
                 signal: context?.abort,
               },
             )
@@ -1860,6 +1966,7 @@ function createScienceDirectPlugin(options: ScienceDirectPluginOptions = {}): To
                 accept: "application/json",
                 sessionToken,
                 fetchImpl,
+                proxy: proxy(),
                 signal: context?.abort,
               })
               if (fallbackResponse.ok) {

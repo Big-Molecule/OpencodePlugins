@@ -1,4 +1,4 @@
-# OpenCodePlugins
+﻿# OpenCodePlugins
 
 Personal OpenCode plugins, managed with Git for backup and machine sync.
 
@@ -8,23 +8,23 @@ Personal OpenCode plugins, managed with Git for backup and machine sync.
 
 ```text
 OpenCodePlugins/
-├── docs/
-│   └── campus-install.md        # 在校园网内电脑上安装并验证的步骤
-├── plugins/
-│   ├── everything-search.ts
-│   ├── image-gen.ts
-│   ├── local-markdown-images.ts
-│   ├── office-docs.ts
-│   └── sciencedirect.ts
-├── skills/
-│   └── office-docs/SKILL.md
-└── scripts/
-    ├── install.ps1
-    └── office/                 # DOCX edit helpers + Word COM render
-        ├── setup-venv.ps1
-        ├── render-docx.ps1
-        ├── export-docx-pdf.vbs
-        └── py/
+鈹溾攢鈹€ docs/
+鈹?  鈹斺攢鈹€ campus-install.md        # 鍦ㄦ牎鍥綉鍐呯數鑴戜笂瀹夎骞堕獙璇佺殑姝ラ
+鈹溾攢鈹€ plugins/
+鈹?  鈹溾攢鈹€ everything-search.ts
+鈹?  鈹溾攢鈹€ image-gen.ts
+鈹?  鈹溾攢鈹€ local-markdown-images.ts
+鈹?  鈹溾攢鈹€ office-docs.ts
+鈹?  鈹斺攢鈹€ sciencedirect.ts
+鈹溾攢鈹€ skills/
+鈹?  鈹斺攢鈹€ office-docs/SKILL.md
+鈹斺攢鈹€ scripts/
+    鈹溾攢鈹€ install.ps1
+    鈹斺攢鈹€ office/                 # DOCX edit helpers + Word COM render
+        鈹溾攢鈹€ setup-venv.ps1
+        鈹溾攢鈹€ render-docx.ps1
+        鈹溾攢鈹€ export-docx-pdf.vbs
+        鈹斺攢鈹€ py/
 ```
 
 ## Install
@@ -51,8 +51,8 @@ Development checks: `npm ci`, `npm run typecheck`, and `npm test`.
 
 `install.ps1` also syncs:
 
-- office scripts → `%LOCALAPPDATA%\opencode-office\scripts`
-- skill → `~\.config\opencode\skills\office-docs`
+- office scripts 鈫?`%LOCALAPPDATA%\opencode-office\scripts`
+- skill 鈫?`~\.config\opencode\skills\office-docs`
 
 ## Plugins
 
@@ -100,7 +100,7 @@ Operates Lolia FRP (lolia.link) tunnels through the same OAuth API the desktop c
 
 ### office-docs (Codex-style local suite)
 
-**Golden path:** edit → `office_render` `all_pages=true` → inspect PNGs → fix → deliver file.
+**Golden path:** edit 鈫?`office_render` `all_pages=true` 鈫?inspect PNGs 鈫?fix 鈫?deliver file.
 
 | Tool | Purpose |
 |------|---------|
@@ -109,11 +109,11 @@ Operates Lolia FRP (lolia.link) tunnels through the same OAuth API the desktop c
 | `office_docx_create` / `edit` / `table` / `format` / `merge` | Create & edit DOCX |
 | `office_xlsx` | Excel info/read/write/create |
 | `office_pdf_text` | PDF text extract |
-| `office_render` | DOCX → page PNGs (Word COM + pdftoppm) |
+| `office_render` | DOCX 鈫?page PNGs (Word COM + pdftoppm) |
 
 **Paths:** config `~\.config\opencode\office-docs.json`; venv/scripts `%LOCALAPPDATA%\opencode-office\`; job temp `<workdir>/.opencode-office/cache/<jobId>/`.
 
-**Requires:** Python ≥ 3.10, Microsoft Word, pdftoppm. No project-venv pollution. No Google Drive.
+**Requires:** Python 鈮?3.10, Microsoft Word, pdftoppm. No project-venv pollution. No Google Drive.
 
 ### image-gen
 
@@ -127,8 +127,7 @@ OpenAI-compatible image generation and editing. Config: `~\.config\opencode\imag
 | `image_generate` | Text-to-image, variants, or a batch of prompts |
 | `image_edit` | Edit a local PNG/JPEG/WebP; optionally upload a PNG mask |
 
-**Setup:** `image_status` → `image_configure action=set_api host=... key=...` →
-`image_list_models` → `image_configure action=set_model model=...`. Setup can be cancelled at any time.
+**Setup:** `image_status` 鈫?`image_configure action=set_api host=... key=...` 鈫?`image_list_models` 鈫?`image_configure action=set_model model=...`. Setup can be cancelled at any time.
 
 **Endpoints and transport:**
 
@@ -136,7 +135,7 @@ OpenAI-compatible image generation and editing. Config: `~\.config\opencode\imag
 - Editing sends `multipart/form-data` with `model`, `prompt`, `size`, `n`, and an actual
   `image` file to `/v1/images/edits`. A supplied mask is uploaded as the `mask` file.
 - The edit path is derived automatically, preserving prefixes: `/proxy/v1/images/generations`
-  → `/proxy/v1/images/edits`. For an unrecognized generation path it defaults to `/v1/images/edits`.
+  鈫?`/proxy/v1/images/edits`. For an unrecognized generation path it defaults to `/v1/images/edits`.
   Override with `image_configure action=set_api edits_path=/custom/images/edits`; use
   `edits_path=auto` to reset. Old configurations need no migration.
 - The stored override is `api.editsPath`; environment variable `IMAGE_GEN_API_EDITS_PATH`
@@ -161,7 +160,7 @@ Source images must be under 50 MB; masks must be PNG, under 4 MB, with the same 
 as the source. Fully transparent mask regions indicate where to edit. Input formats are
 detected from file bytes. Relative paths use the current session directory. Results default
 to `~/Pictures/image-gen` and are saved with the detected PNG/JPEG/WebP/GIF extension.
-`count` selects 1–4 edit variants. `quality=1K|2K|4K` is a resolution preset, not the provider's
+`count` selects 1鈥? edit variants. `quality=1K|2K|4K` is a resolution preset, not the provider's
 `quality` enum; the chosen model must support the requested dimensions (use `1K` for standard sizes).
 
 ### everything-search
@@ -179,7 +178,6 @@ Official Elsevier ScienceDirect API integration (`https://api.elsevier.com`). Co
 | `sciencedirect_authenticate` | Exchange a recognized campus/institutional IP for a two-hour in-memory `authtoken` |
 | `sciencedirect_search` | Search via ScienceDirect Search API v2 (`PUT /content/search/sciencedirect`) with automatic fallback to Article Metadata API (`GET /content/metadata/article`) |
 | `sciencedirect_article` | Retrieve metadata, abstract, or full text by DOI/PII/EID/URL; paginate with `offset` or save the complete text using `output_path` |
-
 **Setup:**
 
 1. Create an API key at <https://dev.elsevier.com/apikey/manage>.
@@ -222,3 +220,27 @@ Config: `~\.config\opencode\latex-normalize.json`.
 - Restart OpenCode after install.
 - Do not commit secrets.
 - Local plugins do not need `plugin: [...]` in opencode.json.
+
+### 校园网机器作出口（Elsevier 专用代理）
+
+机构授权按请求来源 IP 判定。若 OpenCode 不在校园网内，可让一台校园网内的机器充当 Elsevier 专用出口，**不影响模型 API 的流量**。
+
+校内机器上启动正向代理（只监听 Tailscale 地址，且只放行 Elsevier 域名）：
+
+```powershell
+node scripts\campus-proxy.mjs --port 8899 --verbose
+```
+
+另一台机器上，只让插件走这个代理：
+
+```text
+sciencedirect_configure action=set_proxy proxy=http://<校内机Tailscale地址>:8899
+sciencedirect_status
+sciencedirect_authenticate
+```
+
+实现方式：插件用 undici 的 `ProxyAgent` 作为**单请求 dispatcher**，只作用于 `api.elsevier.com`，不设置进程级 `HTTPS_PROXY`。因此模型调用不会被带到校园出口。
+
+相关配置：`~\.config\opencode\sciencedirect.json` 中的 `proxy` 字段，或环境变量 `SCIENCEDIRECT_PROXY`（优先）。清除用 `sciencedirect_configure action=clear_proxy`。
+
+**验证代理是否真的在用**：把 proxy 改成一个不存在的端口，检索应报 `Network error: fetch failed`；若仍返回 HTTP 状态码，说明请求没走代理。

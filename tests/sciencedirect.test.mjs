@@ -1,4 +1,4 @@
-import assert from "node:assert/strict"
+﻿import assert from "node:assert/strict"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -895,7 +895,7 @@ test("saves the complete article text even when the model preview is paginated",
   isolateElsevierEnvironment(t)
   process.env.ELSEVIER_API_KEY = "download-test-key"
   const directory = temporaryDirectory(t)
-  const text = "Introduction. 方法与结果。\n".repeat(100)
+  const text = "Introduction. 鏂规硶涓庣粨鏋溿€俓n".repeat(100)
   let requests = 0
   const hooks = await createScienceDirectPlugin({
     configPath: join(directory, "sciencedirect.json"),
@@ -971,4 +971,65 @@ test("official quota errors are reported without retrying or inventing another l
   assert.match(output, /0\/100 remaining/)
   assert.doesNotMatch(output, /per.*session|excerpts|disclaimer/i)
   assert.equal(requests, 1)
+})
+
+test("routes only Elsevier requests through the configured proxy", async (t) => {
+  isolateElsevierEnvironment(t)
+  const configPath = temporaryConfig(t)
+  const hooks = await createScienceDirectPlugin({ configPath, fetchImpl: async () => new Response("{}") })()
+  await hooks.tool.sciencedirect_configure.execute({ action: "set_key", api_key: "proxy-test-key", skip_verify: true }, toolContext())
+
+  const saved = await hooks.tool.sciencedirect_configure.execute(
+    { action: "set_proxy", proxy: "http://100.89.105.117:8899/" },
+    toolContext(),
+  )
+  assert.match(saved, /only Elsevier requests use it/)
+  assert.equal(loadConfig(configPath).proxy, "http://100.89.105.117:8899")
+
+  const status = await hooks.tool.sciencedirect_status.execute({}, toolContext())
+  assert.match(status, /Proxy \(Elsevier only\): http:\/\/100\.89\.105\.117:8899/)
+
+  process.env.SCIENCEDIRECT_PROXY = "http://127.0.0.1:9999"
+  const envStatus = await hooks.tool.sciencedirect_status.execute({}, toolContext())
+  assert.match(envStatus, /Proxy \(Elsevier only\): http:\/\/127\.0\.0\.1:9999/)
+  delete process.env.SCIENCEDIRECT_PROXY
+
+  await hooks.tool.sciencedirect_configure.execute({ action: "clear_proxy" }, toolContext())
+  assert.equal(loadConfig(configPath).proxy, undefined)
+  assert.match(await hooks.tool.sciencedirect_status.execute({}, toolContext()), /not set \(direct connection\)/)
+})
+
+test("rejects malformed proxy URLs without touching other settings", async (t) => {
+  isolateElsevierEnvironment(t)
+  const configPath = temporaryConfig(t)
+  const hooks = await createScienceDirectPlugin({ configPath, fetchImpl: async () => new Response("{}") })()
+  await hooks.tool.sciencedirect_configure.execute({ action: "set_key", api_key: "keep-me", skip_verify: true }, toolContext())
+
+  for (const bad of ["", "not-a-url", "socks5://host:1080", "http://host", "ftp://host:21"]) {
+    const output = await hooks.tool.sciencedirect_configure.execute({ action: "set_proxy", proxy: bad }, toolContext())
+    assert.match(output, /Error:/, bad)
+  }
+  assert.equal(loadConfig(configPath).apiKey, "keep-me")
+  assert.equal(loadConfig(configPath).proxy, undefined)
+})
+
+test("keeps a saved proxy when updating the API key", async (t) => {
+  isolateElsevierEnvironment(t)
+  const configPath = temporaryConfig(t)
+  const hooks = await createScienceDirectPlugin({ configPath, fetchImpl: async () => new Response(JSON.stringify({ resultsFound: 0, results: [] }), { headers: { "Content-Type": "application/json" } }) })()
+  await hooks.tool.sciencedirect_configure.execute({ action: "set_proxy", proxy: "http://100.89.105.117:8899" }, toolContext())
+  await hooks.tool.sciencedirect_configure.execute({ action: "set_key", api_key: "new-key", skip_verify: true }, toolContext())
+  const stored = loadConfig(configPath)
+  assert.equal(stored.apiKey, "new-key")
+  assert.equal(stored.proxy, "http://100.89.105.117:8899")
+})
+
+test("campus proxy helper narrows forwarding to an allowlist", async () => {
+  const { isAllowed } = await import("../scripts/campus-proxy.mjs")
+  assert.equal(isAllowed("api.elsevier.com"), true)
+  assert.equal(isAllowed("sciencedirect.com"), true)
+  assert.equal(isAllowed("www.sciencedirect.com"), true)
+  assert.equal(isAllowed("evil.example.com"), false)
+  assert.equal(isAllowed("elsevier.com.evil.test"), false)
+  assert.equal(isAllowed(""), false)
 })
