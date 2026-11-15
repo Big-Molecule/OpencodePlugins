@@ -54,7 +54,7 @@ for (const id of ["bandizip", "everything-search", "image-gen", "lolia-frp", "of
       const result = await tools.get("everything_search").execute({ query: " " }, call)
       assert.deepEqual(result, { content: "Error: query is required." })
     }
-    if (id === "sciencedirect") assert.ok(hooks.has("context"))
+    if (id === "sciencedirect") assert.equal(hooks.has("context"), false)
   })
 }
 

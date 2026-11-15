@@ -8,6 +8,8 @@ Personal OpenCode plugins, managed with Git for backup and machine sync.
 
 ```text
 OpenCodePlugins/
+├── docs/
+│   └── campus-install.md        # 在校园网内电脑上安装并验证的步骤
 ├── plugins/
 │   ├── everything-search.ts
 │   ├── image-gen.ts
@@ -62,7 +64,7 @@ Development checks: `npm ci`, `npm run typecheck`, and `npm test`.
 | `latex-normalize.ts` | Hooks only | Normalizes assistant LaTeX for Desktop KaTeX |
 | `local-markdown-images.ts` | Hooks only | Inlines workspace-local Markdown images for Desktop rendering |
 | `office-docs.ts` | `office_*` | DOCX edit (venv python-docx) + Word COM page render (Codex-style) |
-| `sciencedirect.ts` | `sciencedirect_*` | Official Elsevier search, institutional IP auth, abstracts, and bounded entitled excerpts |
+| `sciencedirect.ts` | `sciencedirect_*` | Official Elsevier ScienceDirect search, institutional IP auth, metadata/abstracts, and full-text retrieval |
 
 ### lolia-frp
 
@@ -168,51 +170,34 @@ Global filename search via Everything / `es.exe`.
 
 ### sciencedirect
 
-Uses the official Elsevier APIs. It does not scrape ScienceDirect pages, read browser cookies, or handle university passwords.
-ScienceDirect is one literature-search channel, not an exhaustive or exclusive source. Use other appropriate scholarly databases and web search tools alongside it whenever the task needs broader coverage.
-
-Tools:
+Official Elsevier ScienceDirect API integration (`https://api.elsevier.com`). Config: `~\.config\opencode\sciencedirect.json`.
 
 | Tool | Purpose |
 |------|---------|
-| `sciencedirect_status` | Check credential and in-memory authentication state |
-| `sciencedirect_configure` | Validate, save, verify, or clear a personal API key from the conversation |
-| `sciencedirect_authenticate` | Exchange a currently recognized institutional IP entitlement for a short-lived in-memory authtoken |
-| `sciencedirect_search` | Search with the native ScienceDirect Search API v2 PUT interface |
-| `sciencedirect_article` | Retrieve metadata, abstract, or one bounded entitled excerpt by DOI/PII/other supported ID |
+| `sciencedirect_status` | Check credential and in-memory IP authentication state |
+| `sciencedirect_configure` | Save, verify, or clear `api_key` and optional `inst_token` (supports `api_key_file` / `inst_token_file` from `openchamber_secret`) |
+| `sciencedirect_authenticate` | Exchange a recognized campus/institutional IP for a two-hour in-memory `authtoken` |
+| `sciencedirect_search` | Search via ScienceDirect Search API v2 (`PUT /content/search/sciencedirect`) with automatic fallback to Article Metadata API (`GET /content/metadata/article`) |
+| `sciencedirect_article` | Retrieve metadata, abstract, or full text by DOI/PII/EID/URL; paginate with `offset` or save the complete text using `output_path` |
 
-For first-time setup, call `sciencedirect_status`. The tool guides the assistant to:
+**Setup:**
 
-1. Let the user register a personal key at <https://dev.elsevier.com/apikey/manage>.
-2. Have the user review Elsevier's current [API Service Agreement](https://dev.elsevier.com/api_service_agreement.html) and their institution license.
-3. After the user supplies the personal key and explicitly confirms compliance, call `sciencedirect_configure action=set_key` with `ai_use_confirmed=true`.
-4. Validate the key against `api.elsevier.com`, save it to `~\.config\opencode\sciencedirect.json`, and use it immediately without another restart.
+1. Create an API key at <https://dev.elsevier.com/apikey/manage>.
+2. Configure via `sciencedirect_configure action=set_key api_key=...` (or via `openchamber_secret` + `api_key_file=...`). Valid keys are saved even if the current IP is off-campus so `sciencedirect_authenticate` or `inst_token` can be used afterward.
+3. On campus network/VPN: call `sciencedirect_search` directly (or `sciencedirect_authenticate` if multiple accounts share the campus IP). Ensure `api.elsevier.com` connects directly rather than through a non-campus proxy/TUN.
+4. Off-campus: pass `inst_token=...` to `sciencedirect_configure action=set_key` (or set `ELSEVIER_INST_TOKEN`).
 
-A key supplied in chat is visible to the current OpenCode session/model. The plugin never echoes it in tool output, asks for an explicit OpenCode permission before sending/saving it, and writes the local file with restrictive POSIX permissions. The file is plaintext, and Windows ultimately relies on the user-profile ACL. Users who do not want a key in session history can keep using environment variables instead; an explicitly set environment value overrides the local file for rotation or revocation:
+Non-empty environment overrides (`ELSEVIER_API_KEY`, `ELSEVIER_INST_TOKEN`, `ELSEVIER_AUTHTOKEN`, `ELSEVIER_OAUTH_TOKEN`) take precedence over local config. `SCIENCEDIRECT_API_KEY` is also accepted as an API key alias; `ELSEVIER_API_KEY` wins when both are set. Blank variables do not hide a saved key. Existing `api_key` / `inst_token` config fields and UTF-8 BOM files are supported.
 
-```powershell
-$env:ELSEVIER_API_KEY = "your-personal-api-key"
-$env:ELSEVIER_AI_USE_CONFIRMED = "1"
-opencode
+There is no plugin-imposed per-session article quota, confirmation gate, or global setup-prompt injection. The official API's quota and errors are reported as returned by Elsevier.
+
+To download the entire article text while keeping the model preview short:
+
+```text
+sciencedirect_article identifier="10.1016/j.example.2026.01.001" mode=full_text output_path="papers/article.txt" max_chars=30000
 ```
 
-Never set `ai_use_confirmed=true` on the user's behalf. The agreement currently requires, among other conditions, a closed enterprise-grade AI environment, no external model training, and no third-party access or substantial retention/reproduction.
-
-Optional credentials are `ELSEVIER_INST_TOKEN`, `ELSEVIER_AUTHTOKEN`, and `ELSEVIER_OAUTH_TOKEN`. An authtoken normally expires after two hours. Keep these higher-privilege/short-lived credentials out of this repository, the local ScienceDirect config, and chat history.
-
-An institution token is issued case by case to customers or approved partners and represents the institution's full account entitlement. Elsevier requires it to remain server-side in a password-protected environment. For this local plugin, use a process-scoped environment variable only on a protected machine and only if Elsevier/the library approves the integration; do not persist it with `setx` or put it in an OpenCode config file.
-
-For Nanjing University of Information Science and Technology access:
-
-1. For campus access, connect from an Elsevier-recognized campus IP, then call `sciencedirect_status` and `sciencedirect_authenticate`.
-2. For off-campus API access, ask Elsevier Research Product API Support and the university library whether they will issue an institution token for this use case.
-3. With `ELSEVIER_INST_TOKEN` configured, skip `sciencedirect_authenticate` and call `sciencedirect_search` directly.
-4. Search metadata first, retrieve abstracts only for plausible candidates, and request a bounded excerpt only when necessary.
-5. CARSI authorizes the interactive website, not the API. Open the returned ScienceDirect URL in the CARSI-authenticated browser when needed.
-
-A pop-up login is appropriate only if Elsevier provisions an OAuth client, redirect URI, and documented authorization/token endpoints for this application. The plugin must not derive API credentials by intercepting CARSI cookies or ScienceDirect page responses.
-
-Elsevier and university usage limits still apply. Do not use the plugin for continuous, systematic, concentrated, or bulk downloads.
+`output_path` saves the complete UTF-8 **text**, not a PDF, independently of `max_chars` and `offset`. Relative paths resolve from the current session directory. Existing files are preserved unless `overwrite=true`. If Elsevier only returns metadata or an abstract, the plugin labels it accordingly and does not save it as a full-text file. Network failures and entitlement errors during setup do not discard a supplied key; explicit `APIKEY_INVALID` does not replace an existing saved key.
 
 ### latex-normalize
 
